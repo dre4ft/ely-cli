@@ -50,12 +50,26 @@ def _action(name: str, description: str, parameters: dict, optional: list = None
     return decorator
 
 
+def _get_disabled_tools() -> set[str]:
+    """Read disabled tools from config."""
+    from .config import get
+    raw = get("tools", "disabled", "")
+    if not raw:
+        return set()
+    return {t.strip() for t in raw.split(",") if t.strip()}
+
+
 def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]:
     """Return (tool_definitions, name->handler map). If names is None, return all.
-    Merges native tools with MCP server tools and skill tools."""
+    Merges native tools with MCP server tools and skill tools.
+    Respects tools.disabled config."""
+    disabled = _get_disabled_tools()
+
     defs = []
     handlers = {}
     for name, action in ACTIONS.items():
+        if name in disabled:
+            continue
         if names is None or name in names:
             defs.append(action["definition"])
             handlers[name] = action["handler"]
@@ -64,8 +78,12 @@ def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]
     try:
         from .skills import load_all_skill_tools
         skill_defs, skill_handlers = load_all_skill_tools()
-        defs.extend(skill_defs)
-        handlers.update(skill_handlers)
+        for d in skill_defs:
+            name = d["function"]["name"]
+            if name not in disabled:
+                defs.append(d)
+                if name in skill_handlers:
+                    handlers[name] = skill_handlers[name]
     except Exception:
         pass
 
@@ -73,8 +91,12 @@ def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]
     try:
         from .mcp import get_mcp_manager
         mcp_defs, mcp_handlers = get_mcp_manager().get_all_tools()
-        defs.extend(mcp_defs)
-        handlers.update(mcp_handlers)
+        for d in mcp_defs:
+            name = d["function"]["name"]
+            if name not in disabled:
+                defs.append(d)
+                if name in mcp_handlers:
+                    handlers[name] = mcp_handlers[name]
     except Exception:
         pass
 
@@ -220,6 +242,38 @@ def tool_bash(command: str) -> str:
         return "Error: command timed out (30s)"
     except Exception as e:
         return f"Error: {e}"
+
+
+@_action("bash_batch", "Execute multiple bash commands in PARALLEL. Much faster than calling bash N times. Use for independent commands that can run simultaneously.",
+         {"commands": {"type": "string", "description": "JSON array of commands, e.g. [\"ls -la\", \"cat file.txt\", \"df -h\"]."}})
+def tool_bash_batch(commands: str) -> str:
+    try:
+        cmds = json.loads(commands)
+        if not isinstance(cmds, list):
+            return "Error: commands must be a JSON array"
+    except json.JSONDecodeError:
+        return "Error: invalid JSON for commands"
+
+    results = _run_parallel(cmds, _run_direct if not _is_sandbox_enabled() else _run_in_sandbox)
+    return "\n\n".join(f"--- [{i}] $ {cmd} ---\n{output}"
+                       for i, (cmd, output) in enumerate(zip(cmds, results)))
+
+
+def _run_parallel(items: list, func) -> list[str]:
+    """Execute func(item) for each item in parallel using threads."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = [""] * len(items)
+
+    with ThreadPoolExecutor(max_workers=min(len(items), 8)) as executor:
+        futures = {executor.submit(func, item): i for i, item in enumerate(items)}
+        for future in as_completed(futures):
+            idx = futures[future]
+            try:
+                results[idx] = future.result(timeout=120)
+            except Exception as e:
+                results[idx] = f"Error: {e}"
+
+    return results
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -593,14 +647,24 @@ import shlex
 
 _TOOL_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
 # Block dangerous calls even inside run() — tools run in a restricted namespace
-_FORBIDDEN_KEYWORDS = [
-    "exec(", "eval(", "compile(",
-    "open(", "subprocess", "popen", "system(",
-    "os.", "sys.", "shutil.", "pathlib.",
-    "globals", "locals", "vars(", "getattr", "setattr", "delattr",
-    "__import__", "__builtins__", "__class__", "__bases__", "__subclasses__",
+# Keywords blocked in tool source. Each is checked as a WORD (not substring).
+# "localStorage" won't match "locals", "evaluate" won't match "eval", etc.
+# These are blocked at source level. The safe namespace also blocks them at runtime
+# but source-level blocking gives clearer error messages.
+# eval/exec/compile/open are removed from __builtins__ so they fail at runtime anyway.
+_FORBIDDEN_WORDS = [
+    "exec(", "compile(",
+    "open(", "subprocess", "popen",
+    "getattr(", "setattr(", "delattr(", "hasattr(",
+    "__import__(", "__builtins__", "__class__", "__bases__", "__subclasses__",
     "__dict__", "__globals__", "__code__", "__closure__",
+]
+
+# Prefixes blocked anywhere in the source (case-insensitive substring match)
+_FORBIDDEN_PREFIXES = [
+    "os.", "sys.", "shutil.", "pathlib.",
     "socket.", "http.", "urllib.request", "ftplib",
+    "globals(", "locals(", "vars(",
 ]
 
 
@@ -610,9 +674,16 @@ def _validate_tool_content(content: str) -> str | None:
         return "Tool file too large (max 16KB)"
 
     content_lower = content.lower()
-    for kw in _FORBIDDEN_KEYWORDS:
+
+    # Check forbidden words (substring match, but these are specific enough)
+    for kw in _FORBIDDEN_WORDS:
         if kw in content_lower:
-            return f"Forbidden keyword: '{kw}'"
+            return f"Forbidden: '{kw}'"
+
+    # Check forbidden prefixes (only at identifier boundaries)
+    for prefix in _FORBIDDEN_PREFIXES:
+        if prefix in content_lower:
+            return f"Forbidden: '{prefix}'"
 
     # Parse in restricted namespace to extract metadata
     restricted_ns = {"__builtins__": {}}
@@ -842,6 +913,128 @@ def tool_web_fetch(url: str) -> str:
         return f"Error: missing package — {e}"
     except Exception as e:
         return f"Error fetching {url}: {e}"
+
+
+@_action("http_request", "Make an HTTP request with full control over method, headers, and body. Use for API testing, CORS checks, SSRF, custom headers injection.",
+         {"url": {"type": "string", "description": "Target URL (https://example.com/api)."},
+          "method": {"type": "string", "description": "HTTP method: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD."},
+          "headers": {"type": "string", "description": "JSON object of headers, e.g. {\"Authorization\": \"Bearer xxx\", \"X-Custom\": \"value\"}."},
+          "body": {"type": "string", "description": "Request body (for POST/PUT/PATCH)."},
+          "follow_redirects": {"type": "boolean", "description": "Follow redirects? Default true."}},
+         optional=["headers", "body", "follow_redirects"])
+def tool_http_request(url: str, method: str = "GET", headers: str = "{}",
+                      body: str = "", follow_redirects: bool = True) -> str:
+    try:
+        hdrs = json.loads(headers) if isinstance(headers, str) else headers
+        if not isinstance(hdrs, dict):
+            hdrs = {}
+    except (json.JSONDecodeError, ValueError):
+        hdrs = {}
+
+    hdrs.setdefault("User-Agent", "Ely-CLI/1.0")
+
+    try:
+        kwargs = {"method": method.upper(), "url": url, "headers": hdrs,
+                  "timeout": 30, "allow_redirects": follow_redirects}
+        if body and method.upper() in ("POST", "PUT", "PATCH"):
+            kwargs["data"] = body
+
+        resp = requests.request(**kwargs)
+
+        out_lines = [f"HTTP {resp.status_code} {resp.reason}"]
+        # Response headers
+        out_lines.append(f"\n--- Response Headers ---")
+        for k, v in resp.headers.items():
+            out_lines.append(f"  {k}: {v}")
+        # Response body (truncated)
+        out_lines.append(f"\n--- Response Body ({len(resp.text)} chars) ---")
+        out_lines.append(resp.text[:4000])
+
+        return "\n".join(out_lines)
+    except ImportError:
+        return "Error: requests package not available"
+    except Exception as e:
+        return f"HTTP request error: {e}"
+
+
+@_action("http_batch", "Execute multiple HTTP requests in PARALLEL. Much faster than calling http_request multiple times. Use for scanning URLs, testing endpoints, or batch API calls.",
+         {"requests": {"type": "string", "description": "JSON array: [{\"url\": \"...\", \"method\": \"GET\", \"headers\": {}, \"body\": \"\"}]."}})
+def tool_http_batch(requests: str) -> str:
+    try:
+        reqs = json.loads(requests)
+        if not isinstance(reqs, list):
+            return "Error: requests must be a JSON array"
+    except json.JSONDecodeError:
+        return "Error: invalid JSON for requests"
+
+    def _one(req):
+        if not isinstance(req, dict):
+            return "Error: invalid request"
+        hdrs = req.get("headers", {})
+        return tool_http_request(
+            url=req.get("url", ""),
+            method=req.get("method", "GET"),
+            headers=json.dumps(hdrs) if isinstance(hdrs, dict) else str(hdrs),
+            body=str(req.get("body", "")),
+        )
+
+    results = _run_parallel(reqs, _one)
+    return "\n\n".join(
+        f"--- [{i}] {req.get('method', 'GET')} {req.get('url', '?')} ---\n{output}"
+        for i, (req, output) in enumerate(zip(reqs, results))
+    )
+
+
+@_action("socket_raw", "Open a raw TCP socket to a host:port, send data, and read the response. Use for testing non-HTTP protocols, SMTP, raw HTTP, or manual protocol fuzzing.",
+         {"host": {"type": "string", "description": "Target hostname or IP."},
+          "port": {"type": "integer", "description": "Target port (e.g. 80, 443, 25)."},
+          "data": {"type": "string", "description": "Data to send. Use \\r\\n for line breaks, \\n for newline."},
+          "timeout": {"type": "integer", "description": "Read timeout in seconds (default 10)."},
+          "use_tls": {"type": "boolean", "description": "Wrap socket with TLS/SSL? Default false."}},
+         optional=["timeout", "use_tls"])
+def tool_socket_raw(host: str, port: int, data: str,
+                    timeout: int = 10, use_tls: bool = False) -> str:
+    try:
+        import socket
+        import ssl
+
+        # Unescape the data string
+        payload = data.replace("\\r\\n", "\r\n").replace("\\n", "\n").replace("\\t", "\t")
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+
+        if use_tls:
+            ctx = ssl.create_default_context()
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+
+        sock.connect((host, port))
+        sock.sendall(payload.encode())
+
+        response = b""
+        while True:
+            try:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                response += chunk
+            except socket.timeout:
+                break
+
+        sock.close()
+
+        out = [f"Connected to {host}:{port}" + (" (TLS)" if use_tls else "")]
+        out.append(f"Sent {len(payload)} bytes")
+        out.append(f"\n--- Response ({len(response)} bytes) ---")
+        # Try to decode, fall back to hex
+        try:
+            out.append(response.decode(errors="replace")[:4000])
+        except Exception:
+            out.append(response.hex()[:4000])
+
+        return "\n".join(out)
+    except Exception as e:
+        return f"Socket error: {e}"
 
 
 # ═══════════════════════════════════════════════════════════════

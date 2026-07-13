@@ -30,8 +30,7 @@ _DEFAULTS = {
         "compaction_rounds": 10,
     },
     "tools": {
-        "bash_enabled": True,
-        "web_search_enabled": True,
+        "disabled": "",  # Comma-separated tool names to disable, e.g. "bash,web_search"
     },
     "mcp": {
         "servers": [],

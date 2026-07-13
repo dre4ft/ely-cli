@@ -20,7 +20,7 @@ agent:
 
 memory:
   dir: ~/.ely/memory
-  compaction_rounds: 6
+  compaction_rounds: 10
 
 tools:
   # Workspace racine — tous les chemins de fichiers sont relatifs à ce répertoire
@@ -28,4 +28,31 @@ tools:
   # Bash sandbox: "direct" (machine hôte) ou "docker" (conteneur isolé)
   # L'agent NE PEUT PAS changer ce réglage au runtime
   bash_sandbox: direct
-  web_search_enabled: true
+  # Outils désactivés (séparés par des virgules). Laisse vide pour tout activer.
+  # Liste complète: bash, bash_batch, read_file, write_file, list_directory,
+  #   grep, web_search, web_fetch, http_request, http_batch, socket_raw,
+  #   diary_add, diary_list, diary_search, diary_get,
+  #   task, task_parallel,
+  #   skill_create, skill_add_tool, skill_add_reference, skill_add_asset
+  # Exemples utiles:
+  #   disabled: "bash, bash_batch"             → agent sans shell
+  #   disabled: "write_file"                   → agent read-only
+  #   disabled: "task, task_parallel"          → pas de sous-agents
+  disabled: ""
+
+# MCP (Model Context Protocol) servers — optional
+# Tools from these servers are auto-discovered and merged into the agent's toolset.
+mcp:
+  servers: []
+  # Example stdio server:
+  # - name: filesystem
+  #   command: npx
+  #   args: ["-y", "@modelcontextprotocol/server-filesystem", "/allowed/path"]
+  #   env: {}
+  #
+  # Example remote SSE server:
+  # - name: remote-api
+  #   url: https://mcp.example.com/sse
+  #   transport: sse
+  #   headers:
+  #     Authorization: "Bearer xxx"

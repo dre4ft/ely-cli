@@ -152,8 +152,9 @@ def _show_help():
 
     console.print()
     console.print(table)
-    console.print("\n[dim]LLM = envoyé à l'agent pour traitement | Tab = autocomplétion[/]")
-    console.print("[dim]Les commandes sans [LLM] sont traitées localement.[/]")
+    console.print()
+    console.print("[bold]#<commande>[/] [dim]— Exécute une commande bash directement (sandbox ou terminal)[/]")
+    console.print("[dim]LLM = envoyé à l'agent | Tab = autocomplétion | [/][bold]#[/] [dim]= bash direct[/]")
 
 
 def _load_history():
@@ -325,7 +326,10 @@ def repl(context: str = "", slot: str = "provider"):
     cfg = get_provider_config(slot)
 
     from ely.tools import _is_sandbox_enabled, _workspace_dir
-    from ely.skills import get_active_skills, build_skills_status_line
+    from ely.skills import get_active_skills, build_skills_status_line, load_active_skills
+
+    # Load persisted skill activation
+    load_active_skills()
     from ely.contexts import load_active_context, save_active_context
 
     # Load persisted context, fall back to CLI arg or default
@@ -345,7 +349,7 @@ def repl(context: str = "", slot: str = "provider"):
     _setup_readline()
 
     console.print(f"[bold]Ely[/] · {cfg['model']} · ctx: {context} · bash: {sandbox} · 📁 {ws}{skill_status}")
-    console.print("[dim]Tape /help pour l'aide, Tab pour autocompléter, exit pour quitter.[/]\n")
+    console.print("[dim]#commande = bash direct | /help = aide | Tab = autocompléter | exit = quitter[/]\n")
 
     while True:
         try:
@@ -368,6 +372,16 @@ def repl(context: str = "", slot: str = "provider"):
             cleanup_sandbox()
             break
 
+        # ── Direct bash command: #ls -la ──
+        if user_input.startswith("#"):
+            cmd = user_input[1:].strip()
+            if cmd:
+                from ely.tools import tool_bash
+                output = tool_bash(cmd)
+                console.print(f"[dim]$ {cmd}[/]")
+                console.print(output)
+            continue
+
         # ── Slash command dispatch ──
         if user_input.startswith("/"):
             cmd_parts = user_input.split()
@@ -378,7 +392,9 @@ def repl(context: str = "", slot: str = "provider"):
                 continue
             if cmd == "/clear":
                 history = []
-                console.print("[dim]Historique effacé.[/]")
+                total_tokens = {"prompt": 0, "completion": 0, "total": 0}
+                console.clear()
+                console.print("[dim]✨ Conversation purgée — historique et tokens remis à zéro.[/]\n")
                 continue
             if cmd == "/tokens":
                 console.print(f"[dim]🪙 Total: {total_tokens['total']:,} tokens (prompt: {total_tokens['prompt']:,}, completion: {total_tokens['completion']:,})[/]")

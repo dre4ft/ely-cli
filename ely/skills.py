@@ -129,30 +129,60 @@ class Skill:
 
 # ── Skill activation ──
 
+import json as _json
+
 _active_skills: set[str] = {"ely"}
 
 
+def _active_skills_file() -> str:
+    return os.path.join(os.path.expanduser("~"), ".ely", "active_skills.json")
+
+
+def save_active_skills():
+    """Persist active skills to disk."""
+    os.makedirs(os.path.dirname(_active_skills_file()), exist_ok=True)
+    with open(_active_skills_file(), "w") as f:
+        _json.dump(sorted(_active_skills), f)
+
+
+def load_active_skills():
+    """Load persisted active skills from disk."""
+    global _active_skills
+    path = _active_skills_file()
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                saved = _json.load(f)
+            if isinstance(saved, list):
+                _active_skills = set(saved)
+                # Always ensure 'ely' is active
+                _active_skills.add("ely")
+        except Exception:
+            pass
+
+
 def activate_skill(name: str) -> bool:
-    """Activate a skill. Returns True if successful."""
+    """Activate a skill. Persists to disk. Returns True if successful."""
     if name in list_skills():
         _active_skills.add(name)
+        save_active_skills()
         return True
     return False
 
 
 def deactivate_skill(name: str) -> bool:
-    """Deactivate a skill. Cannot deactivate 'ely' base skill. Returns True if successful."""
+    """Deactivate a skill. Cannot deactivate 'ely' base skill. Persists to disk."""
     if name == "ely":
         return False
     if name in _active_skills:
         _active_skills.discard(name)
+        save_active_skills()
         return True
     return False
 
 
 def get_active_skills() -> set[str]:
     """Return set of currently active skill names."""
-    # Only return skills that actually exist
     available = set(list_skills())
     return _active_skills & available
 
@@ -265,46 +295,33 @@ def _make_safe_handler(run_func, skill_name: str, tool_name: str):
 
 
 def _extract_tool_meta(source: str) -> dict | None:
-    """Extract tool metadata from source using regex patterns.
-    Avoids executing code in a broken namespace so run() keeps proper builtins.
+    """Extract tool metadata by executing the file in a restricted namespace.
+    The run() function is captured but won't have proper builtins —
+    we re-exec in a safe namespace later if has_run is True.
     """
     meta = {}
+    restricted = {"__builtins__": {}}
 
-    # NAME = "..." or NAME = '...'
-    m = _re.search(r'^NAME\s*=\s*["\']([^"\']+)["\']', source, _re.MULTILINE)
-    if m:
-        meta["NAME"] = m.group(1)
+    try:
+        exec(source, restricted)
+    except Exception:
+        return None
 
-    # DESCRIPTION = "..."
-    m = _re.search(r'^DESCRIPTION\s*=\s*["\']([^"\']+)["\']', source, _re.MULTILINE)
-    if m:
-        meta["DESCRIPTION"] = m.group(1)
+    name = restricted.get("NAME", "")
+    if not name or not isinstance(name, str):
+        return None
 
-    # COMMAND = "..."
-    m = _re.search(r'^COMMAND\s*=\s*["\']([^"\']+)["\']', source, _re.MULTILINE)
-    if m:
-        meta["COMMAND"] = m.group(1)
+    meta["NAME"] = name
+    meta["DESCRIPTION"] = restricted.get("DESCRIPTION", "")
+    meta["PARAMETERS"] = restricted.get("PARAMETERS", {})
+    meta["COMMAND"] = restricted.get("COMMAND", "")
+    meta["has_run"] = callable(restricted.get("run"))
+    meta["TIMEOUT"] = restricted.get("TIMEOUT", 30)
 
-    # PARAMETERS = {...} — extract the dict literal
-    m = _re.search(r'^PARAMETERS\s*=\s*(\{.*?\})', source, _re.MULTILINE | _re.DOTALL)
-    if m:
-        try:
-            # Safe eval for a dict literal (no identifiers, only literals)
-            params = eval(m.group(1), {"__builtins__": {}})
-            if isinstance(params, dict):
-                meta["PARAMETERS"] = params
-        except Exception:
-            meta["PARAMETERS"] = {}
+    if not isinstance(meta["PARAMETERS"], dict):
+        meta["PARAMETERS"] = {}
 
-    # Check for def run(
-    meta["has_run"] = bool(_re.search(r'^def\s+run\s*\(', source, _re.MULTILINE))
-
-    # Check for TIMEOUT
-    m = _re.search(r'^TIMEOUT\s*=\s*(\d+)', source, _re.MULTILINE)
-    if m:
-        meta["TIMEOUT"] = int(m.group(1))
-
-    return meta if meta.get("NAME") else None
+    return meta
 
 
 def _skill_dirs() -> list[str]:
