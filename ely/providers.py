@@ -16,7 +16,9 @@ class OpenAIProvider:
         http_client = DefaultHttpxClient(verify=False)
         if "litellm" in url:
             header = {"x-litellm-api-key":api_key}
-        self.client = OpenAI(base_url=url, api_key=api_key or "not-needed",http_client=http_client,default_headers=header or None)
+            self.client = OpenAI(base_url=url, api_key=api_key or "not-needed",http_client=http_client,default_headers=header)
+        else:
+            self.client = OpenAI(base_url=url, api_key=api_key or "not-needed",http_client=http_client)
 
     def chat(self, messages: list, tools: list = None) -> dict:
         kwargs = {"model": self.model, "messages": messages}

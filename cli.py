@@ -556,24 +556,27 @@ def repl(context: str = "", slot: str = "provider"):
                 preview += f"\n[dim]... ({len(lines)} lignes)[/]"
             console.print(Panel(Text.from_markup(preview), title="💭 Réflexion", border_style="dim", padding=(0, 1)))
 
+        # Sticky header before each reply
+        skill_line = build_skills_status_line()
+        h = f"Ely · {result.get('model', cfg['model'])} · ctx: {context} · bash: {sandbox} · 📁 {ws}"
+        if skill_line:
+            h += f" · {skill_line}"
+        console.print(f"[dim]{h}[/]")
+
         console.print()
         console.print(Markdown(reply))
-        if actions or True:  # Always show info line
-            skill_line = build_skills_status_line()
-            parts = []
-            if actions:
-                parts.append(f"🔧 {', '.join(actions)}")
-            parts.append(f"🪙 {t.get('total', 0):,} tokens")
-            parts.append(f"🧠 {result.get('model', '?')}")
-            if skill_line:
-                parts.append(skill_line)
-            console.print(f"[dim]{' | '.join(parts)}[/]")
+        if actions:
+            console.print(
+                f"[dim]🔧 {', '.join(actions)} | "
+                f"🪙 {t.get('total', 0):,} tokens[/]"
+            )
         console.print()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Ely — CLI AI Agent")
     parser.add_argument("query", nargs="*", help="Question (single-shot mode)")
+    parser.add_argument("--config", default="", help="Path to ely.yaml config file")
     parser.add_argument("--tui", action="store_true", default=False, help="TUI cockpit mode")
     parser.add_argument("--no-tui", action="store_true", help="Simple REPL mode (default)")
     parser.add_argument("--context", default="default", help="Context (default, code, sysadmin, research)")
@@ -582,6 +585,10 @@ def main():
     parser.add_argument("--workspace", default="", help="Workspace directory (all file ops scoped here)")
     parser.add_argument("--sandbox", default="", help="Bash mode: docker or direct (agent cannot change this)")
     args = parser.parse_args()
+
+    if args.config:
+        from ely.config import set_config_path
+        set_config_path(args.config)
 
     query = " ".join(args.query)
     slot = "pro_provider" if args.pro else "provider"

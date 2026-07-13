@@ -40,9 +40,21 @@ _DEFAULTS = {
 }
 
 _config = None
+_config_path_override = None
+
+
+def set_config_path(path: str):
+    """Set an explicit config file path (from --config CLI arg)."""
+    global _config_path_override, _config
+    _config_path_override = path
+    _config = None  # Force reload
 
 
 def _find_config():
+    if _config_path_override:
+        if os.path.isfile(_config_path_override):
+            return _config_path_override
+        # Warn but don't crash — fall back to default search
     paths = [
         os.path.join(os.getcwd(), "ely.yaml"),
         os.path.join(Path.home(), ".ely", "config.yaml"),

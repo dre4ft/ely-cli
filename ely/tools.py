@@ -1010,8 +1010,16 @@ def tool_web_fetch(url: str) -> str:
     try:
         resp = requests.get(url, timeout=15, headers={"User-Agent": "Ely-CLI/1.0"})
         resp.raise_for_status()
-        from bs4 import BeautifulSoup
-        soup = BeautifulSoup(resp.text, "html.parser")
+        ct = resp.headers.get("Content-Type", "").lower()
+        from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+        import warnings
+        # Pick parser based on content type, suppress XML-in-HTML warning
+        if "xml" in ct or "rss" in ct or "atom" in ct:
+            soup = BeautifulSoup(resp.text, "xml")
+        else:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+                soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup(["script", "style", "nav", "footer", "header"]):
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
