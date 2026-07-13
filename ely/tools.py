@@ -622,24 +622,31 @@ def tool_task_parallel(tasks: str) -> str:
 # Tools execute bash commands with shell-escaped parameter substitution.
 # This ensures tools respect the sandbox setting and cannot run arbitrary Python.
 
-TOOL_TEMPLATE = '''# Ely skill tool — must follow this template exactly
-NAME = "tool_name"            # Required: [a-z][a-z0-9_]+
-DESCRIPTION = "what it does"  # Required: one-line description
-PARAMETERS = {                # Required: parameters with type/description
-    "arg": {"type": "string", "description": "what this arg does"},
-}
+TOOL_TEMPLATE = '''# Ely skill tool — standard Python import
+# Define your tools and their handler below.
 
-# Option A — Simple: bash command with {param} substitution
-COMMAND = "bash command {arg}"
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "my_tool",
+            "description": "What this tool does",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "arg1": {"type": "string", "description": "First argument"},
+                },
+                "required": ["arg1"],
+            },
+        },
+    },
+]
 
-# Option B — Advanced: Python function with safe builtins + tool_bash()
-def run(tool_bash, **kwargs) -> str:
-    """tool_bash(cmd) runs a sandboxed command and returns stdout.
-    Safe builtins available: str, int, list, dict, json, re, True, False, None."""
-    result = tool_bash(f"echo Processing {kwargs['arg']}")
-    return result.strip()
-
-TIMEOUT = 30  # Optional: 1-120 seconds (default 30)
+def handle_tool(tool_name: str, parameters: dict) -> str:
+    """Dispatch the tool call. Must return a string."""
+    if tool_name == "my_tool":
+        return f"Result: {parameters['arg1']}"
+    return f"Unknown tool: {tool_name}"
 '''
 
 import re
@@ -650,89 +657,15 @@ _TOOL_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
 # Keywords blocked in tool source. Each is checked as a WORD (not substring).
 # "localStorage" won't match "locals", "evaluate" won't match "eval", etc.
 # These are blocked at source level. The safe namespace also blocks them at runtime
-# but source-level blocking gives clearer error messages.
-# eval/exec/compile/open are removed from __builtins__ so they fail at runtime anyway.
-_FORBIDDEN_WORDS = [
-    "exec(", "compile(",
-    "open(", "subprocess", "popen",
-    "getattr(", "setattr(", "delattr(", "hasattr(",
-    "__import__(", "__builtins__", "__class__", "__bases__", "__subclasses__",
-    "__dict__", "__globals__", "__code__", "__closure__",
-]
-
-# Prefixes blocked anywhere in the source (case-insensitive substring match)
-_FORBIDDEN_PREFIXES = [
-    "os.", "sys.", "shutil.", "pathlib.",
-    "socket.", "http.", "urllib.request", "ftplib",
-    "globals(", "locals(", "vars(",
-]
-
-
 def _validate_tool_content(content: str) -> str | None:
-    """Validate a skill tool file. Returns error message or None if valid."""
-    if len(content) > 16384:
-        return "Tool file too large (max 16KB)"
-
-    content_lower = content.lower()
-
-    # Check forbidden words (substring match, but these are specific enough)
-    for kw in _FORBIDDEN_WORDS:
-        if kw in content_lower:
-            return f"Forbidden: '{kw}'"
-
-    # Check forbidden prefixes (only at identifier boundaries)
-    for prefix in _FORBIDDEN_PREFIXES:
-        if prefix in content_lower:
-            return f"Forbidden: '{prefix}'"
-
-    # Parse in restricted namespace to extract metadata
-    restricted_ns = {"__builtins__": {}}
+    """Validate a skill tool file. Only checks syntax — no restrictions.
+    Skill tools are trusted Python code imported normally."""
+    if len(content) > 65536:
+        return "Tool file too large (max 64KB)"
     try:
-        exec(content, restricted_ns)
-    except Exception as e:
+        compile(content, "<tool>", "exec")
+    except SyntaxError as e:
         return f"Syntax error: {e}"
-
-    # Validate required fields
-    name = restricted_ns.get("NAME", "")
-    description = restricted_ns.get("DESCRIPTION", "")
-    params = restricted_ns.get("PARAMETERS", {})
-    has_command = bool(restricted_ns.get("COMMAND", ""))
-    has_run = callable(restricted_ns.get("run"))
-
-    if not name or not isinstance(name, str):
-        return "Missing or invalid NAME"
-    if not _TOOL_NAME_RE.match(name):
-        return f"Invalid NAME '{name}': must match [a-z][a-z0-9_]*"
-    if not description or not isinstance(description, str):
-        return "Missing or invalid DESCRIPTION"
-    if not isinstance(params, dict):
-        return "PARAMETERS must be a dict"
-    if not has_command and not has_run:
-        return "Must define either COMMAND or def run(tool_bash, **kwargs)"
-
-    # Validate PARAMETERS
-    for pname, pdef in params.items():
-        if not isinstance(pdef, dict):
-            return f"Parameter '{pname}': must be a dict with 'type' and 'description'"
-        if "type" not in pdef:
-            return f"Parameter '{pname}': missing 'type'"
-        if pdef["type"] not in ("string", "integer", "boolean"):
-            return f"Parameter '{pname}': type must be string, integer, or boolean"
-
-    # Validate COMMAND placeholders if using template mode
-    if has_command:
-        cmd = restricted_ns.get("COMMAND", "")
-        placeholders = set(re.findall(r'\{(\w+)\}', cmd))
-        param_names = set(params.keys())
-        unknown = placeholders - param_names
-        if unknown:
-            return f"COMMAND has unknown placeholders: {', '.join(unknown)}"
-
-    # Check timeout
-    timeout = restricted_ns.get("TIMEOUT", 30)
-    if not isinstance(timeout, (int, float)) or timeout < 1 or timeout > 120:
-        return "TIMEOUT must be 1-120 seconds"
-
     return None
 
 
@@ -780,15 +713,14 @@ def tool_skill_create(name: str, description: str, instructions: str) -> str:
     return f"Skill '{name}' created in {skill_dir}"
 
 
-@_action("skill_add_tool", "Add a tool to a skill. Tools execute bash commands with parameter substitution. Must follow the tool template exactly.",
+@_action("skill_add_tool", "Add a Python tool module to a skill. Must define TOOLS list and handle_tool(name, params) function. Uses standard Python imports — no restrictions.",
          {"skill_name": {"type": "string", "description": "The skill to add the tool to."},
-          "tool_filename": {"type": "string", "description": "Python filename (e.g. 'deploy.py'). Must end with .py"},
-          "content": {"type": "string", "description": "Tool definition following the template: NAME, DESCRIPTION, PARAMETERS, COMMAND."}})
+          "tool_filename": {"type": "string", "description": "Python filename (e.g. 'my_tools.py'). Must end with .py"},
+          "content": {"type": "string", "description": "Python code with TOOLS list and handle_tool() function."}})
 def tool_skill_add_tool(skill_name: str, tool_filename: str, content: str) -> str:
     if not tool_filename.endswith(".py"):
         return "Error: tool filename must end with .py"
 
-    # Validate against template before saving
     error = _validate_tool_content(content)
     if error:
         return f"Error: invalid tool — {error}"
@@ -806,12 +738,7 @@ def tool_skill_add_tool(skill_name: str, tool_filename: str, content: str) -> st
     with open(tool_path, "w") as f:
         f.write(content)
 
-    # Extract name for confirmation
-    restricted_ns = {"__builtins__": {}}
-    exec(content, restricted_ns)
-    tool_name = restricted_ns.get("NAME", tool_filename)
-
-    return f"Tool '{tool_name}' added to skill '{skill_name}' ({len(content)} bytes)."
+    return f"Tool '{tool_filename}' added to skill '{skill_name}' ({len(content)} bytes)."
 
 
 @_action("skill_add_reference", "Add a reference document to a skill. References provide the agent with domain knowledge or documentation.",

@@ -25,6 +25,7 @@ Tool files are Python modules with:
   def run(**kwargs) -> str: ...
 '''
 
+import importlib.util
 import os
 from dataclasses import dataclass, field
 
@@ -59,11 +60,13 @@ class Skill:
         return []
 
     def load_tools(self) -> tuple[list[dict], dict[str, callable]]:
-        """Load skill tools and return (definitions, handlers).
+        """Load skill tools via standard Python import.
 
-        Two modes:
-        1. COMMAND template: bash command with {param} substitution (simple, sandboxed)
-        2. def run(tool_bash, **kwargs): Python with safe builtins (advanced)
+        Each .py file in tools/ must export:
+          TOOLS = [{"type": "function", "function": {...}}, ...]
+          def handle_tool(name: str, parameters: dict) -> str: ...
+
+        Tool names are prefixed: skill__<skill_name>__<tool_name>
         """
         definitions = []
         handlers = {}
@@ -72,54 +75,57 @@ class Skill:
             module_path = os.path.join(self.tools_dir, tool_file)
 
             try:
-                with open(module_path) as f:
-                    source = f.read()
+                # Import the module normally — no restrictions
+                spec = importlib.util.spec_from_file_location(
+                    f"ely_skill_{self.name}_{tool_file[:-3]}", module_path
+                )
+                if not spec or not spec.loader:
+                    continue
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
 
-                # Step 1: extract metadata via regex (no execution needed)
-                meta = _extract_tool_meta(source)
-                if not meta:
+                # Get tool definitions
+                tools = getattr(mod, "TOOLS", [])
+                if not isinstance(tools, list):
                     continue
 
-                tool_name = meta.get("NAME", tool_file[:-3])
-                prefixed = f"skill__{self.name}__{tool_name}"
-                description = meta.get("DESCRIPTION", "")
-                params = meta.get("PARAMETERS", {})
-                command_template = meta.get("COMMAND", "")
-                has_run = meta.get("has_run", False)
+                # Get dispatcher
+                dispatcher = getattr(mod, "handle_tool", None)
+                if not callable(dispatcher):
+                    continue
 
-                # Build OpenAI-format tool definition
-                properties = {}
-                required = []
-                for k, v in params.items():
-                    properties[k] = {
-                        "type": v.get("type", "string"),
-                        "description": v.get("description", ""),
+                # Register each tool with skill prefix
+                for tool_def in tools:
+                    if not isinstance(tool_def, dict):
+                        continue
+                    func_info = tool_def.get("function", {})
+                    original_name = func_info.get("name", "")
+                    if not original_name:
+                        continue
+
+                    prefixed = f"skill__{self.name}__{original_name}"
+
+                    # Update the name in the definition to include skill prefix
+                    prefixed_def = {
+                        "type": "function",
+                        "function": {
+                            **func_info,
+                            "name": prefixed,
+                            "description": f"[Skill:{self.name}] {func_info.get('description', '')}",
+                        },
                     }
-                    if v.get("required", True):
-                        required.append(k)
+                    definitions.append(prefixed_def)
 
-                definitions.append({
-                    "type": "function",
-                    "function": {
-                        "name": prefixed,
-                        "description": f"[Skill:{self.name}] {description}",
-                        "parameters": {
-                            "type": "object",
-                            "properties": properties,
-                            "required": required,
-                        } if properties else {"type": "object", "properties": {}},
-                    },
-                })
+                    # Create handler that dispatches to this module's handle_tool
+                    def make_handler(d, orig_name):
+                        def handler(**kwargs):
+                            try:
+                                return str(d(orig_name, kwargs))
+                            except Exception as e:
+                                return f"Tool error [{self.name}/{orig_name}]: {e}"
+                        return handler
 
-                if has_run:
-                    # Step 2: exec source in SAFE namespace so run() gets proper builtins
-                    safe_ns = dict(_SAFE_BUILTINS)
-                    exec(source, safe_ns)
-                    run_func = safe_ns.get("run")
-                    if callable(run_func):
-                        handlers[prefixed] = _make_safe_handler(run_func, self.name, tool_name)
-                elif command_template:
-                    handlers[prefixed] = _make_template_handler(command_template)
+                    handlers[prefixed] = make_handler(dispatcher, original_name)
 
             except Exception:
                 pass  # Skip broken tool modules
@@ -185,143 +191,6 @@ def get_active_skills() -> set[str]:
     """Return set of currently active skill names."""
     available = set(list_skills())
     return _active_skills & available
-
-
-# ── Safe builtins for skill tool run() functions ──
-
-import json as _json
-import re as _re
-import shlex as _shlex
-
-# Whitelist of modules that skill tools can import
-_SAFE_MODULES = {
-    # Data formats
-    "json", "csv", "configparser", "tomllib",
-    # Text
-    "re", "string", "textwrap", "difflib",
-    # Crypto/hashing
-    "hashlib", "base64", "binascii", "hmac",
-    # Data structures
-    "collections", "itertools", "functools", "operator",
-    "heapq", "bisect", "array", "struct",
-    # Math
-    "math", "statistics", "decimal", "fractions", "random",
-    # Date/time
-    "datetime", "calendar", "time",
-    # Internet/parsing
-    "urllib.parse", "urllib", "html", "html.parser",
-    "xml.etree.ElementTree", "xml",
-    # Typing
-    "typing", "enum", "dataclasses",
-    # Utilities
-    "copy", "pprint", "inspect", "argparse",
-    "fnmatch", "glob", "gzip", "zlib",
-    "hashlib", "secrets",
-    # Encoding
-    "codecs", "unicodedata",
-    "quopri", "uu",
-}
-
-
-def _safe_import(name: str, *args, **kwargs):
-    """Restricted __import__ — only allows whitelisted stdlib modules."""
-    # Allow top-level module or submodule of allowed modules
-    parts = name.split(".")
-    check = name
-    allowed = False
-    while check:
-        if check in _SAFE_MODULES:
-            allowed = True
-            break
-        check = ".".join(check.split(".")[:-1]) if "." in check else ""
-    if not allowed:
-        raise ImportError(f"Module '{name}' is not allowed in skill tools")
-    return __import__(name, *args, **kwargs)
-
-
-_SAFE_BUILTINS = {
-    # Types
-    "str": str, "int": int, "float": float, "bool": bool,
-    "list": list, "dict": dict, "tuple": tuple, "set": set, "frozenset": frozenset,
-    "bytes": bytes, "bytearray": bytearray,
-    # Constants
-    "True": True, "False": False, "None": None,
-    # Functions
-    "len": len, "range": range, "enumerate": enumerate,
-    "zip": zip, "map": map, "filter": filter,
-    "sorted": sorted, "reversed": reversed,
-    "min": min, "max": max, "sum": sum, "abs": abs, "round": round,
-    "isinstance": isinstance, "type": type,
-    "print": print, "format": format, "repr": repr,
-    "ord": ord, "chr": chr, "hash": hash,
-    "__import__": _safe_import,
-    # Pre-imported modules (always available without import)
-    "json": _json,
-    "re": _re,
-}
-
-
-def _make_template_handler(command_template: str):
-    """Create a handler for COMMAND template mode."""
-    def handler(**kwargs):
-        cmd = command_template
-        for k, v in kwargs.items():
-            escaped = _shlex.quote(str(v))
-            cmd = cmd.replace("{" + k + "}", escaped)
-        from .tools import tool_bash
-        return tool_bash(cmd)
-    return handler
-
-
-def _make_safe_handler(run_func, skill_name: str, tool_name: str):
-    """Create a handler that wraps run() with safe builtins + tool_bash()."""
-    def handler(**kwargs):
-        # tool_bash passes through the sandbox
-        def tool_bash(cmd: str) -> str:
-            from .tools import tool_bash as _tool_bash
-            return _tool_bash(cmd)
-
-        # Build safe execution environment
-        safe_globals = dict(_SAFE_BUILTINS)
-        safe_globals["tool_bash"] = tool_bash
-
-        try:
-            result = run_func(tool_bash, **kwargs)
-            return str(result)
-        except Exception as e:
-            return f"Tool error [{skill_name}/{tool_name}]: {e}"
-
-    return handler
-
-
-def _extract_tool_meta(source: str) -> dict | None:
-    """Extract tool metadata by executing the file in a restricted namespace.
-    The run() function is captured but won't have proper builtins —
-    we re-exec in a safe namespace later if has_run is True.
-    """
-    meta = {}
-    restricted = {"__builtins__": {}}
-
-    try:
-        exec(source, restricted)
-    except Exception:
-        return None
-
-    name = restricted.get("NAME", "")
-    if not name or not isinstance(name, str):
-        return None
-
-    meta["NAME"] = name
-    meta["DESCRIPTION"] = restricted.get("DESCRIPTION", "")
-    meta["PARAMETERS"] = restricted.get("PARAMETERS", {})
-    meta["COMMAND"] = restricted.get("COMMAND", "")
-    meta["has_run"] = callable(restricted.get("run"))
-    meta["TIMEOUT"] = restricted.get("TIMEOUT", 30)
-
-    if not isinstance(meta["PARAMETERS"], dict):
-        meta["PARAMETERS"] = {}
-
-    return meta
 
 
 def _skill_dirs() -> list[str]:
