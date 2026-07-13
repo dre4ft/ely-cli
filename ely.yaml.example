@@ -1,6 +1,9 @@
 # Ely CLI Configuration
 # Copy to ~/.ely/config.yaml or ./ely.yaml
 
+ely:
+  dir: ~/.ely              # Base directory for all Ely data (skills, memory, diary, contexts, history)
+
 provider:
   type: openai           # openai, ollama, lmstudio
   model: gpt-4o-mini
@@ -19,7 +22,6 @@ agent:
   language: fr
 
 memory:
-  dir: ~/.ely/memory
   compaction_rounds: 10
 
 tools:

@@ -282,7 +282,8 @@ def _run_parallel(items: list, func) -> list[str]:
 
 def _diary_dir() -> str:
     from .config import get
-    d = os.path.join(os.path.expanduser(get("memory", "dir", "~/.ely/memory")), "diary")
+    from .config import get_ely_dir
+    d = get_ely_dir("memory/diary")
     os.makedirs(d, exist_ok=True)
     return d
 
@@ -323,7 +324,8 @@ def _next_diary_id() -> int:
 def _migrate_old_diary():
     """Migrate from old diary.json to individual files."""
     from .config import get
-    old_path = os.path.join(os.path.expanduser(get("memory", "dir", "~/.ely/memory")), "diary.json")
+    from .config import get_ely_dir
+    old_path = get_ely_dir("memory/diary.json")
     if os.path.isfile(old_path):
         try:
             with open(old_path) as f:
@@ -671,7 +673,8 @@ def _validate_tool_content(content: str) -> str | None:
 
 def _skills_user_dir() -> str:
     """User-level skills directory."""
-    return os.path.join(os.path.expanduser("~"), ".ely", "skills")
+    from .config import get_ely_dir
+    return os.path.join(get_ely_dir(), "skills")
 
 
 def _validate_skill_path(base_dir: str, name: str) -> str:

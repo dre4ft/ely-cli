@@ -10,9 +10,8 @@ import time
 
 
 def _memory_dir() -> str:
-    from .config import get
-    d = get("memory", "dir", "~/.ely/memory")
-    return os.path.expanduser(d)
+    from .config import get_ely_dir
+    return get_ely_dir("memory")
 
 
 def _memory_file(user_id: str) -> str:

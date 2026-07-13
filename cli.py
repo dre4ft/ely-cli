@@ -31,7 +31,9 @@ from ely.agent import chat
 from ely.config import get, get_provider_config, get_bool
 
 console = Console()
-HISTORY_FILE = os.path.expanduser("~/.ely/chat_history.json")
+
+from ely.config import get_ely_dir
+HISTORY_FILE = os.path.join(get_ely_dir(), "chat_history.json")
 
 # ── Slash command registry (name → description, subcommands) ──
 
@@ -55,7 +57,7 @@ COMMANDS = {
 LLM_COMMANDS = {"/explain", "/fix", "/refactor", "/test"}
 
 
-HISTFILE = os.path.expanduser("~/.ely/history")
+HISTFILE = os.path.join(get_ely_dir(), "history")
 
 
 def _setup_readline():
@@ -215,7 +217,7 @@ def _handle_skill(user_input: str):
     if not sub or sub == "list":
         all_skills = list_skills()
         active = get_active_skills()
-        console.print(f"[bold]Compétences disponibles :[/]")
+        console.print(f"[bold]Compétences disponibles (une seule à la fois) :[/]")
         for s in all_skills:
             marker = "[green]● actif[/]" if s in active else "[dim]○ inactif[/]"
             skill = load_skill(s)
@@ -392,10 +394,9 @@ def repl(context: str = "", slot: str = "provider"):
     ws = os.path.basename(_workspace_dir())
 
     active = get_active_skills()
-    skill_status = ""
-    if active != {"ely"}:
-        expert_names = [n for n in active if n != "ely"]
-        skill_status = f" · 🧠 {', '.join(expert_names)}"
+    skill_status = build_skills_status_line()
+    if skill_status:
+        skill_status = f" · {skill_status}"
 
     _setup_readline()
 
@@ -465,7 +466,8 @@ def repl(context: str = "", slot: str = "provider"):
             if cmd in ("/pro", "/flash"):
                 slot = "pro_provider" if cmd == "/pro" else "provider"
                 cfg = get_provider_config(slot)
-                console.print(f"[green]✓ Provider : [bold]{cfg['model']}[/] · ctx: {context} · {'🧠 ' + ', '.join(n for n in get_active_skills() if n != 'ely') if get_active_skills() != {'ely'} else 'base'}[/]")
+                skill_line = build_skills_status_line()
+                console.print(f"[green]✓ Provider : [bold]{cfg['model']}[/] · ctx: {context}{' · ' + skill_line if skill_line else ''}[/]")
                 continue
 
             # LLM commands — pass through to the agent

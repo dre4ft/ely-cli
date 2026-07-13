@@ -141,7 +141,8 @@ _active_skills: set[str] = {"ely"}
 
 
 def _active_skills_file() -> str:
-    return os.path.join(os.path.expanduser("~"), ".ely", "active_skills.json")
+    from .config import get_ely_dir
+    return os.path.join(get_ely_dir(), "active_skills.json")
 
 
 def save_active_skills():
@@ -168,12 +169,17 @@ def load_active_skills():
 
 
 def activate_skill(name: str) -> bool:
-    """Activate a skill. Persists to disk. Returns True if successful."""
-    if name in list_skills():
-        _active_skills.add(name)
-        save_active_skills()
-        return True
-    return False
+    """Activate a skill. Deactivates any previously active non-ely skill.
+    Only one skill can be active at a time (plus 'ely'). Persists to disk."""
+    if name not in list_skills():
+        return False
+    # Deactivate all non-ely skills first
+    for s in list(_active_skills):
+        if s != "ely":
+            _active_skills.discard(s)
+    _active_skills.add(name)
+    save_active_skills()
+    return True
 
 
 def deactivate_skill(name: str) -> bool:
@@ -199,7 +205,8 @@ def _skill_dirs() -> list[str]:
     project = os.path.join(os.getcwd(), "skills")
     if os.path.isdir(project):
         dirs.append(project)
-    user = os.path.join(os.path.expanduser("~"), ".ely", "skills")
+    from .config import get_ely_dir
+    user = os.path.join(get_ely_dir(), "skills")
     if os.path.isdir(user):
         dirs.append(user)
     return dirs
@@ -347,15 +354,7 @@ def build_skills_prompt() -> str:
 
 
 def build_skills_status_line() -> str:
-    """Build a compact one-line status showing active skills (for REPL output)."""
+    """Build a compact one-line status showing the active skill (for REPL output)."""
     active = get_active_skills()
-    all_skills = list_skills()
-
-    if active == {"ely"}:
-        return ""  # default, nothing to show
-
-    expert_names = [n for n in active if n != "ely"]
-    parts = []
-    if expert_names:
-        parts.append(f"🧠 {', '.join(expert_names)}")
-    return " · ".join(parts) if parts else ""
+    expert = next((n for n in active if n != "ely"), None)
+    return f"🧠 {expert}" if expert else ""

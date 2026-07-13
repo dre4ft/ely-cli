@@ -25,8 +25,10 @@ _DEFAULTS = {
         "name": "Ely",
         "language": "fr",
     },
+    "ely": {
+        "dir": "~/.ely",          # Base directory for all Ely data
+    },
     "memory": {
-        "dir": "~/.ely/memory",
         "compaction_rounds": 10,
     },
     "tools": {
@@ -82,6 +84,14 @@ def _load():
 
 def get(section: str, key: str, default: str = "") -> str:
     return _load().get(f"{section}.{key}", default)
+
+
+def get_ely_dir(subdir: str = "") -> str:
+    """Return a path under the Ely data directory. Respects ely.dir config."""
+    base = os.path.expanduser(get("ely", "dir", "~/.ely"))
+    if subdir:
+        return os.path.join(base, subdir)
+    return base
 
 
 def get_bool(section: str, key: str, default: bool = False) -> bool:

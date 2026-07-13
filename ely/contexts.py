@@ -20,11 +20,12 @@ import os
 
 def _contexts_dirs() -> list[str]:
     """Return context search directories, project first (higher priority)."""
+    from .config import get_ely_dir
     dirs = []
     project = os.path.join(os.getcwd(), ".ely", "contexts")
     if os.path.isdir(project):
         dirs.append(project)
-    user = os.path.join(os.path.expanduser("~"), ".ely", "contexts")
+    user = os.path.join(get_ely_dir(), "contexts")
     if os.path.isdir(user):
         dirs.append(user)
     return dirs
@@ -32,7 +33,8 @@ def _contexts_dirs() -> list[str]:
 
 def _ensure_defaults():
     """Create default contexts if they don't exist."""
-    user_dir = os.path.join(os.path.expanduser("~"), ".ely", "contexts")
+    from .config import get_ely_dir
+    user_dir = os.path.join(get_ely_dir(), "contexts")
     os.makedirs(user_dir, exist_ok=True)
 
     defaults = {
@@ -130,7 +132,8 @@ def get_context_prompt(name: str) -> str:
 
 def create_context(name: str, description: str, prompt: str) -> str:
     """Create a custom context in the user directory. Returns path."""
-    user_dir = os.path.join(os.path.expanduser("~"), ".ely", "contexts")
+    from .config import get_ely_dir
+    user_dir = os.path.join(get_ely_dir(), "contexts")
     os.makedirs(user_dir, exist_ok=True)
 
     content = f"---\nname: {name}\ndescription: {description}\n---\n\n{prompt}"
@@ -141,7 +144,8 @@ def create_context(name: str, description: str, prompt: str) -> str:
 
 
 def _active_context_file() -> str:
-    return os.path.join(os.path.expanduser("~"), ".ely", "context.json")
+    from .config import get_ely_dir
+    return os.path.join(get_ely_dir(), "context.json")
 
 
 def save_active_context(name: str):
