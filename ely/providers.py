@@ -4,7 +4,7 @@ Extracted from ai_core/providers_api/. No dependencies on Elyria.
 """
 
 import json
-from openai import OpenAI
+from openai import OpenAI, DefaultHttpxClient
 
 
 class OpenAIProvider:
@@ -13,7 +13,10 @@ class OpenAIProvider:
     def __init__(self, model: str, url: str = "https://api.openai.com/v1", api_key: str = ""):
         self.model = model
         self.url = url
-        self.client = OpenAI(base_url=url, api_key=api_key or "not-needed")
+        http_client = DefaultHttpxClient(verify=False)
+        if "litellm" in url:
+            header = {"x-litellm-api-key":api_key}
+        self.client = OpenAI(base_url=url, api_key=api_key or "not-needed",http_client=http_client,default_headers=header or None)
 
     def chat(self, messages: list, tools: list = None) -> dict:
         kwargs = {"model": self.model, "messages": messages}
@@ -128,6 +131,7 @@ def create_provider(config: dict):
         # LM Studio is OpenAI-compatible
         return OpenAIProvider(model=model, url=config.get("url", "http://localhost:1234/v1"), api_key="not-needed")
     else:
+        
         # openai or any OpenAI-compatible endpoint
         return OpenAIProvider(
             model=model,
