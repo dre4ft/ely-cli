@@ -1,6 +1,5 @@
 *.yaml
-.venv
-.claude
 *__pycache__
 sandbox
 tests
+.*

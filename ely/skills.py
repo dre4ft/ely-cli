@@ -62,12 +62,14 @@ class Skill:
     def load_tools(self) -> tuple[list[dict], dict[str, callable]]:
         """Load skill tools via standard Python import.
 
-        Each .py file in tools/ must export:
-          TOOLS = [{"type": "function", "function": {...}}, ...]
-          def handle_tool(name: str, parameters: dict) -> str: ...
+        Each .py file in tools/ defines tool_* functions.
+        The backend auto-generates TOOLS + handle_tool from them.
+        Explicit TOOLS/handle_tool still supported for backward compat.
 
         Tool names are prefixed: skill__<skill_name>__<tool_name>
         """
+        from .tools import _extract_tools_from_module
+
         definitions = []
         handlers = {}
 
@@ -75,7 +77,6 @@ class Skill:
             module_path = os.path.join(self.tools_dir, tool_file)
 
             try:
-                # Import the module normally — no restrictions
                 spec = importlib.util.spec_from_file_location(
                     f"ely_skill_{self.name}_{tool_file[:-3]}", module_path
                 )
@@ -84,28 +85,24 @@ class Skill:
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
 
-                # Get tool definitions
-                tools = getattr(mod, "TOOLS", [])
-                if not isinstance(tools, list):
-                    continue
-
-                # Get dispatcher
+                # Check for explicit TOOLS first (backward compat)
+                tools = getattr(mod, "TOOLS", None)
                 dispatcher = getattr(mod, "handle_tool", None)
-                if not callable(dispatcher):
+
+                if tools is None or not callable(dispatcher):
+                    # Auto-generate from tool_* functions
+                    tools, dispatcher = _extract_tools_from_module(mod)
+
+                if not tools or not callable(dispatcher):
                     continue
 
-                # Register each tool with skill prefix
                 for tool_def in tools:
-                    if not isinstance(tool_def, dict):
-                        continue
                     func_info = tool_def.get("function", {})
                     original_name = func_info.get("name", "")
                     if not original_name:
                         continue
 
                     prefixed = f"skill__{self.name}__{original_name}"
-
-                    # Update the name in the definition to include skill prefix
                     prefixed_def = {
                         "type": "function",
                         "function": {
@@ -116,7 +113,6 @@ class Skill:
                     }
                     definitions.append(prefixed_def)
 
-                    # Create handler that dispatches to this module's handle_tool
                     def make_handler(d, orig_name):
                         def handler(**kwargs):
                             try:
@@ -128,7 +124,7 @@ class Skill:
                     handlers[prefixed] = make_handler(dispatcher, original_name)
 
             except Exception:
-                pass  # Skip broken tool modules
+                pass
 
         return definitions, handlers
 

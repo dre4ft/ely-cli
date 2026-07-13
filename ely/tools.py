@@ -61,7 +61,7 @@ def _get_disabled_tools() -> set[str]:
 
 def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]:
     """Return (tool_definitions, name->handler map). If names is None, return all.
-    Merges native tools with MCP server tools and skill tools.
+    Merges native tools with custom tools, skill tools, and MCP tools.
     Respects tools.disabled config."""
     disabled = _get_disabled_tools()
 
@@ -74,7 +74,19 @@ def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]
             defs.append(action["definition"])
             handlers[name] = action["handler"]
 
-    # Merge skill tools (Python tools from loaded skills)
+    # Merge global custom tools (~/.ely/tools/)
+    try:
+        custom_defs, custom_handlers = _load_custom_tools()
+        for d in custom_defs:
+            name = d["function"]["name"]
+            if name not in disabled:
+                defs.append(d)
+                if name in custom_handlers:
+                    handlers[name] = custom_handlers[name]
+    except Exception:
+        pass
+
+    # Merge skill tools (Python tools from active skill)
     try:
         from .skills import load_all_skill_tools
         skill_defs, skill_handlers = load_all_skill_tools()
@@ -101,6 +113,78 @@ def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]
         pass
 
     return defs, handlers
+
+
+def _custom_tools_dir() -> str:
+    from .config import get_ely_dir
+    return get_ely_dir("tools")
+
+
+def _load_custom_tools() -> tuple[list[dict], dict[str, callable]]:
+    """Load global custom tools from ~/.ely/tools/.
+    Scans for tool_* functions, auto-generates TOOLS + dispatcher."""
+    import importlib.util
+
+    d = _custom_tools_dir()
+    if not os.path.isdir(d):
+        return [], {}
+
+    definitions = []
+    handlers = {}
+
+    for fname in sorted(os.listdir(d)):
+        if not fname.endswith(".py"):
+            continue
+        module_path = os.path.join(d, fname)
+        try:
+            spec = importlib.util.spec_from_file_location(f"ely_custom_{fname[:-3]}", module_path)
+            if not spec or not spec.loader:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            # Check for explicit TOOLS/handle_tool first (backward compat)
+            tools = getattr(mod, "TOOLS", None)
+            dispatcher = getattr(mod, "handle_tool", None)
+
+            if tools is None or not callable(dispatcher):
+                # Auto-generate from tool_* functions
+                tools, dispatcher = _extract_tools_from_module(mod)
+
+            if not tools or not callable(dispatcher):
+                continue
+
+            for tool_def in tools:
+                func_info = tool_def.get("function", {})
+                original_name = func_info.get("name", "")
+                if not original_name:
+                    continue
+
+                prefixed = f"custom__{original_name}"
+                prefixed_def = {
+                    "type": "function",
+                    "function": {
+                        **func_info,
+                        "name": prefixed,
+                        "description": f"[Custom] {func_info.get('description', '')}",
+                    },
+                }
+                definitions.append(prefixed_def)
+
+                def make_handler(d, orig_name):
+                    def handler(**kwargs):
+                        try:
+                            return str(d(orig_name, kwargs))
+                        except Exception as e:
+                            return f"Tool error [custom/{orig_name}]: {e}"
+                    return handler
+
+                handlers[prefixed] = make_handler(dispatcher, original_name)
+
+        except Exception:
+            pass
+
+    return definitions, handlers
 
 
 def get_tool_names() -> list[str]:
@@ -617,6 +701,43 @@ def tool_task_parallel(tasks: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# Custom global tools — user-defined tools always available
+# ═══════════════════════════════════════════════════════════════
+
+@_action("custom_tool_add", "Create a global custom tool available in all sessions. Same format as skill tools: TOOLS list + handle_tool(name, params) function.",
+         {"tool_filename": {"type": "string", "description": "Python filename (e.g. 'my_utils.py'). Must end with .py"},
+          "content": {"type": "string", "description": "Python code with TOOLS list and handle_tool(name, params) -> str function."}})
+def tool_custom_tool_add(tool_filename: str, content: str) -> str:
+    if not tool_filename.endswith(".py"):
+        return "Error: filename must end with .py"
+
+    error = _validate_tool_content(content)
+    if error:
+        return f"Error: invalid tool — {error}"
+
+    d = _custom_tools_dir()
+    os.makedirs(d, exist_ok=True)
+    tool_path = os.path.join(d, tool_filename)
+
+    with open(tool_path, "w") as f:
+        f.write(content)
+
+    return f"Global custom tool '{tool_filename}' saved to {tool_path}"
+
+
+@_action("custom_tool_list", "List global custom tools.",
+         {})
+def tool_custom_tool_list() -> str:
+    d = _custom_tools_dir()
+    if not os.path.isdir(d):
+        return "No custom tools directory."
+    files = sorted(f for f in os.listdir(d) if f.endswith(".py"))
+    if not files:
+        return "No custom tools. Create one with custom_tool_add."
+    return "\n".join(f"  - {f}" for f in files)
+
+
+# ═══════════════════════════════════════════════════════════════
 # Skill management tools — create and extend agent skills
 # ═══════════════════════════════════════════════════════════════
 
@@ -624,32 +745,89 @@ def tool_task_parallel(tasks: str) -> str:
 # Tools execute bash commands with shell-escaped parameter substitution.
 # This ensures tools respect the sandbox setting and cannot run arbitrary Python.
 
-TOOL_TEMPLATE = '''# Ely skill tool — standard Python import
-# Define your tools and their handler below.
+TOOL_TEMPLATE = '''# Ely tool — define functions with tool_ prefix.
+# Each tool_xxx() function becomes a tool automatically.
+# Docstring = tool description. Type hints = parameters.
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "my_tool",
-            "description": "What this tool does",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "arg1": {"type": "string", "description": "First argument"},
-                },
-                "required": ["arg1"],
-            },
-        },
-    },
-]
-
-def handle_tool(tool_name: str, parameters: dict) -> str:
-    """Dispatch the tool call. Must return a string."""
-    if tool_name == "my_tool":
-        return f"Result: {parameters['arg1']}"
-    return f"Unknown tool: {tool_name}"
+def tool_my_tool(arg1: str = "") -> str:
+    """What this tool does."""
+    return f"Result: {arg1}"
 '''
+
+
+def _extract_tools_from_module(mod) -> tuple[list[dict], callable]:
+    """Scan a module for tool_* functions and auto-generate TOOLS + dispatcher.
+    Each function: tool_<name>(...) -> str with a docstring.
+    Type hints become parameter types. Default values become optional params."""
+    import inspect
+
+    tools = []
+    funcs = {}
+
+    for attr_name in dir(mod):
+        if not attr_name.startswith("tool_"):
+            continue
+        func = getattr(mod, attr_name)
+        if not callable(func):
+            continue
+
+        tool_name = attr_name[5:]  # strip "tool_" prefix
+        description = (func.__doc__ or "").strip().split("\n")[0]
+        funcs[tool_name] = func
+
+        # Extract parameters from signature
+        try:
+            sig = inspect.signature(func)
+        except (ValueError, TypeError):
+            sig = None
+
+        properties = {}
+        required = []
+        if sig:
+            for pname, param in sig.parameters.items():
+                if pname in ("self", "cls"):
+                    continue
+                ptype = "string"
+                if param.annotation is not inspect.Parameter.empty:
+                    ann = param.annotation
+                    if ann is int:
+                        ptype = "integer"
+                    elif ann is bool:
+                        ptype = "boolean"
+                    elif ann is float:
+                        ptype = "number"
+
+                properties[pname] = {
+                    "type": ptype,
+                    "description": f"Parameter: {pname}",
+                }
+                if param.default is inspect.Parameter.empty:
+                    required.append(pname)
+
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": tool_name,
+                "description": description,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                } if properties else {"type": "object", "properties": {}},
+            },
+        })
+
+    # Auto-generate dispatcher
+    def handle_tool(tool_name: str, params: dict) -> str:
+        func = funcs.get(tool_name)
+        if not func:
+            return f"Unknown tool: {tool_name}"
+        try:
+            return str(func(**params))
+        except Exception as e:
+            return f"Tool error [{tool_name}]: {e}"
+
+    return tools, handle_tool
 
 import re
 import shlex
