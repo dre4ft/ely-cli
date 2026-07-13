@@ -68,18 +68,34 @@ class StdioTransport:
             stderr=subprocess.PIPE,
             env=self.env,
         )
+        # Drain stderr in background to prevent pipe buffer from blocking the server
+        self._stderr_lines = []
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        """Read stderr continuously to prevent pipe blocking."""
+        try:
+            while self.process and self.process.poll() is None:
+                line = self.process.stderr.readline()
+                if not line:
+                    break
+                self._stderr_lines.append(line.decode(errors="replace").rstrip())
+        except Exception:
+            pass
 
     def send(self, message: dict) -> dict | None:
-        """Send a JSON-RPC request and wait for the response."""
+        """Send a JSON-RPC request and wait for the response.
+        Uses newline-delimited JSON (compatible with both FastMCP and spec servers).
+        """
         if not self.process or self.process.poll() is not None:
             return None
 
-        payload = json.dumps(message)
-        frame = f"Content-Length: {len(payload)}\r\n\r\n{payload}"
+        payload = json.dumps(message) + "\n"
 
         with self._lock:
             try:
-                self.process.stdin.write(frame.encode())
+                self.process.stdin.write(payload.encode())
                 self.process.stdin.flush()
             except (BrokenPipeError, OSError):
                 return None
@@ -90,32 +106,54 @@ class StdioTransport:
         if not self.process or self.process.poll() is not None:
             return
         try:
-            payload = json.dumps(message)
-            frame = f"Content-Length: {len(payload)}\r\n\r\n{payload}"
+            payload = json.dumps(message) + "\n"
             with self._lock:
-                self.process.stdin.write(frame.encode())
+                self.process.stdin.write(payload.encode())
                 self.process.stdin.flush()
         except (BrokenPipeError, OSError):
             pass
 
-    def _read_response(self) -> dict | None:
-        """Read a single JSON-RPC message from stdout."""
+    def _read_response(self, timeout: float = 30.0) -> dict | None:
+        """Read a single JSON-RPC message from stdout.
+        Handles both Content-Length framed (spec) and newline-delimited (FastMCP) formats.
+        """
+        import select
         try:
-            # Read headers
+            readable, _, _ = select.select([self.process.stdout], [], [], timeout)
+            if not readable:
+                return None
+
+            # Peek at first bytes to detect format
+            first = self.process.stdout.read(1)
+            if not first:
+                return None
+
+            first_line = first + self.process.stdout.readline()
+            first_str = first_line.decode().strip()
+
+            # Format 1: newline-delimited JSON (FastMCP, some servers)
+            if first_str.startswith("{"):
+                return json.loads(first_str)
+
+            # Format 2: Content-Length framed (MCP spec)
             headers = {}
-            while True:
-                line = b""
-                while not line.endswith(b"\r\n"):
-                    ch = self.process.stdout.read(1)
-                    if not ch:
-                        return None
-                    line += ch
-                line_decoded = line.decode().strip()
-                if not line_decoded:
+            if ":" in first_str:
+                key, val = first_str.split(":", 1)
+                headers[key.strip().lower()] = val.strip()
+
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                readable, _, _ = select.select([self.process.stdout], [], [], deadline - time.time())
+                if not readable:
+                    return None
+                line = self.process.stdout.readline().decode().strip()
+                if not line:
                     break
-                if ":" in line_decoded:
-                    key, val = line_decoded.split(":", 1)
+                if ":" in line:
+                    key, val = line.split(":", 1)
                     headers[key.strip().lower()] = val.strip()
+            else:
+                return None
 
             content_length = int(headers.get("content-length", 0))
             if content_length <= 0:
@@ -130,12 +168,16 @@ class StdioTransport:
         if self.process:
             try:
                 self.process.stdin.close()
-                self.process.stdout.close()
-                self.process.stderr.close()
-                self.process.terminate()
-                self.process.wait(timeout=5)
             except Exception:
-                self.process.kill()
+                pass
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=3)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
             self.process = None
 
 
@@ -262,46 +304,71 @@ class MCPClient:
         self._tools = []
         self._resources = []
         self._connected = False
+        self._error = ""
 
     def connect(self):
-        """Start transport and perform MCP handshake."""
+        """Start transport and perform MCP handshake. Returns (ok, error_message)."""
+        import shutil as _shutil
+
         transport_type = self.config.get("transport", "stdio")
 
         if transport_type == "sse":
             url = self.config.get("url", "")
             if not url:
-                raise ValueError(f"MCP server '{self.name}': url required for SSE transport")
+                return False, f"'{self.name}': url required for SSE transport"
             self.transport = SSETransport(url, self.config.get("headers"))
         else:
             command = self.config.get("command", "")
             if not command:
-                raise ValueError(f"MCP server '{self.name}': command required for stdio transport")
+                return False, f"'{self.name}': command required for stdio transport"
+
+            # Pre-flight: check if command exists
+            if not _shutil.which(command.split()[0]):
+                self._error = f"command not found: {command}"
+                return False, self._error
+
+            # If npx, allow extra startup time for package download
+            startup_timeout = 30 if "npx" in command else 10
+
             self.transport = StdioTransport(
                 command,
                 self.config.get("args", []),
                 self.config.get("env"),
             )
 
-        self.transport.start()
+        try:
+            self.transport.start()
+        except Exception as e:
+            return False, f"'{self.name}': failed to start: {e}"
 
         # Initialize handshake
         init_resp = self.transport.send(_rpc_request("initialize", {
-            "protocolVersion": "2024-11-05",
+            "protocolVersion": "2025-03-26",
             "capabilities": {},
             "clientInfo": {"name": "Ely", "version": "1.0"},
         }))
 
-        if init_resp:
-            # Send initialized notification
-            self.transport.send_notification(_rpc_notification("notifications/initialized"))
+        if init_resp is None:
+            stderr_tail = ""
+            if hasattr(self.transport, '_stderr_lines') and self.transport._stderr_lines:
+                tail = self.transport._stderr_lines[-3:]
+                stderr_tail = " | stderr: " + "; ".join(tail)[:150]
+            self._error = f"no response{stderr_tail}"
+            self.transport.close()
+            return False, self._error
 
-            # Small delay for server to process
-            time.sleep(0.2)
+        if "error" in init_resp:
+            err = init_resp["error"].get("message", str(init_resp["error"]))
+            self.transport.close()
+            return False, f"'{self.name}': {err}"
 
-            self._connected = True
+        # Send initialized notification
+        self.transport.send_notification(_rpc_notification("notifications/initialized"))
+        time.sleep(0.1)
 
-            # Discover tools and resources
-            self._discover()
+        self._connected = True
+        self._discover()
+        return True, f"{len(self._tools)} tools, {len(self._resources)} resources"
 
     def _discover(self):
         """Discover available tools and resources."""
@@ -416,20 +483,37 @@ class MCPManager:
 
         return list(self.clients.values())
 
-    def connect_all(self):
-        """Connect to all configured MCP servers."""
+    def connect_all(self, timeout: float = 15.0):
+        """Connect to all configured MCP servers. Timeout per server."""
+        import threading
+
         if self._initialized:
             return
 
-        # If no clients loaded yet, try from config
         if not self.clients:
             self.load_from_config()
 
         for name, client in self.clients.items():
-            try:
-                client.connect()
-            except Exception:
-                pass  # Failed servers are skipped gracefully
+            result = [None]
+
+            def _connect():
+                try:
+                    ok, msg = client.connect()
+                    result[0] = (ok, msg)
+                except Exception as e:
+                    result[0] = (False, str(e))
+
+            t = threading.Thread(target=_connect, daemon=True)
+            t.start()
+            t.join(timeout=timeout)
+
+            if result[0] is None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                client._error = f"timeout after {timeout}s"
+                result[0] = (False, client._error)
 
         self._initialized = True
 
@@ -481,6 +565,22 @@ class MCPManager:
                 desc = r.get("description", "") or r.get("name", "")
                 lines.append(f"- `{uri}` — {desc}")
         return "\n".join(lines) if lines else ""
+
+    def get_status(self) -> list[dict]:
+        """Return status of all configured servers for display."""
+        status = []
+        for name, client in self.clients.items():
+            status.append({
+                "name": name,
+                "connected": client._connected,
+                "tools_count": len(client.tools),
+                "resources_count": len(client.resources),
+                "transport": client.config.get("transport", "stdio"),
+                "command": client.config.get("command") or client.config.get("url", ""),
+                "args": client.config.get("args", []),
+                "error": client._error if not client._connected else "",
+            })
+        return status
 
     def close_all(self):
         for client in self.clients.values():

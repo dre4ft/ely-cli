@@ -47,6 +47,7 @@ COMMANDS = {
     "/clear":      ("Effacer l'historique de conversation", None),
     "/diary":      ("Gérer le diary persistant", ["list", "add", "search", "get"]),
     "/skill":      ("Gérer les compétences", ["list", "activate", "deactivate"]),
+    "/mcp":        ("Gérer les serveurs MCP connectés", ["list", "reload"]),
     "/help":       ("Afficher cette aide", None),
 }
 
@@ -238,6 +239,56 @@ def _handle_skill(user_input: str):
         console.print("[cyan]/skill [list] | /skill activate <nom> | /skill deactivate <nom>[/]")
 
 
+def _handle_mcp(user_input: str):
+    """Handle /mcp commands — manage MCP server connections."""
+    from ely.mcp import get_mcp_manager
+
+    parts = user_input.split(maxsplit=1)
+    sub = parts[1].strip() if len(parts) > 1 else ""
+
+    mgr = get_mcp_manager()
+
+    if not sub or sub == "list":
+        if not mgr.clients:
+            mgr.load_from_config()
+
+        status = mgr.get_status()
+        if not status:
+            console.print("[dim]Aucun serveur MCP configuré.[/]")
+            console.print("[dim]Ajoute des serveurs dans ely.yaml → mcp.servers, puis /mcp reload[/]")
+            return
+
+        console.print(f"[bold]Serveurs MCP ({len(status)}) :[/]")
+        for s in status:
+            icon = "[green]●[/]" if s["connected"] else "[red]○[/]"
+            args_hint = " ".join(s.get("args", [])[:2]) if s.get("args") else ""
+            if s["connected"]:
+                detail = f"{s['tools_count']} tools, {s['resources_count']} resources"
+            elif s.get("error"):
+                detail = f"[red]{s['error']}[/]"
+            else:
+                detail = "[dim]non connecté — /mcp reload pour essayer[/]"
+            console.print(f"  {icon} [cyan]{s['name']}[/] · {s.get('command', '')} {args_hint}")
+            console.print(f"    {detail}")
+    elif sub == "reload":
+        mgr.close_all()
+        mgr.load_from_config()
+        try:
+            mgr.connect_all()
+            status = mgr.get_status()
+            if not status:
+                console.print("[dim]Aucun serveur MCP configuré.[/]")
+                return
+            for s in status:
+                icon = "[green]●[/]" if s["connected"] else "[red]○[/]"
+                detail = f"{s['tools_count']} tools" if s["connected"] else s.get("error", "échec")
+                console.print(f"  {icon} {s['name']}: {detail}")
+        except Exception as e:
+            console.print(f"[red]Erreur MCP: {e}[/]")
+    else:
+        console.print("[cyan]/mcp [list] | /mcp reload[/]")
+
+
 def _handle_context(user_input: str, current_context: str) -> str:
     """Handle /context commands. Returns the (possibly updated) context name."""
     from ely.contexts import (
@@ -404,6 +455,9 @@ def repl(context: str = "", slot: str = "provider"):
                 continue
             if cmd.startswith("/skill"):
                 _handle_skill(user_input)
+                continue
+            if cmd.startswith("/mcp"):
+                _handle_mcp(user_input)
                 continue
             if cmd.startswith("/context"):
                 context = _handle_context(user_input, context)
