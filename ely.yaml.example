@@ -1,0 +1,31 @@
+# Ely CLI Configuration
+# Copy to ~/.ely/config.yaml or ./ely.yaml
+
+provider:
+  type: openai           # openai, ollama, lmstudio
+  model: gpt-4o-mini
+  url: https://api.openai.com/v1
+  api_key: ""            # or set OPENAI_API_KEY env var
+
+pro_provider:
+  type: openai
+  model: gpt-4o
+  url: https://api.openai.com/v1
+  api_key: ""
+
+agent:
+  max_turns: 8
+  name: Ely
+  language: fr
+
+memory:
+  dir: ~/.ely/memory
+  compaction_rounds: 6
+
+tools:
+  # Workspace racine — tous les chemins de fichiers sont relatifs à ce répertoire
+  workspace: "."         # ou chemin absolu: /home/user/projects
+  # Bash sandbox: "direct" (machine hôte) ou "docker" (conteneur isolé)
+  # L'agent NE PEUT PAS changer ce réglage au runtime
+  bash_sandbox: direct
+  web_search_enabled: true

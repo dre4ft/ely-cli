@@ -1,0 +1,876 @@
+"""
+Tool registry and generic CLI tools.
+Uses the decorator-based registration pattern from ely/elys_tools.py.
+
+Security:
+  - File tools are scoped to a workspace directory (config: tools.workspace).
+    All paths are prefixed and validated — no escape possible.
+  - Bash sandbox mode is set at startup, NOT changeable by the agent.
+  - toggle_sandbox is NOT registered as a tool (only usable via CLI flags).
+
+Diary:
+  - The agent has a persistent diary (JSON file) for notes between sessions.
+  - Tools: diary_add, diary_list, diary_search, diary_get.
+"""
+
+import json
+import os
+import re
+import subprocess
+import requests
+from pathlib import Path
+from typing import Callable
+
+# Global tool registry — tools registered here are available to the agent
+ACTIONS: dict[str, dict] = {}
+
+
+def _action(name: str, description: str, parameters: dict, optional: list = None):
+    """Decorator that registers a handler as a tool in ACTIONS."""
+    optional = optional or []
+
+    def decorator(handler: Callable):
+        ACTIONS[name] = {
+            "definition": {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": {
+                        "type": "object",
+                        "properties": parameters,
+                        "required": [k for k in parameters if k not in optional],
+                    },
+                },
+            },
+            "handler": handler,
+        }
+        return handler
+
+    return decorator
+
+
+def get_tools(names: list[str] = None) -> tuple[list[dict], dict[str, Callable]]:
+    """Return (tool_definitions, name->handler map). If names is None, return all.
+    Merges native tools with MCP server tools and skill tools."""
+    defs = []
+    handlers = {}
+    for name, action in ACTIONS.items():
+        if names is None or name in names:
+            defs.append(action["definition"])
+            handlers[name] = action["handler"]
+
+    # Merge skill tools (Python tools from loaded skills)
+    try:
+        from .skills import load_all_skill_tools
+        skill_defs, skill_handlers = load_all_skill_tools()
+        defs.extend(skill_defs)
+        handlers.update(skill_handlers)
+    except Exception:
+        pass
+
+    # Merge MCP tools
+    try:
+        from .mcp import get_mcp_manager
+        mcp_defs, mcp_handlers = get_mcp_manager().get_all_tools()
+        defs.extend(mcp_defs)
+        handlers.update(mcp_handlers)
+    except Exception:
+        pass
+
+    return defs, handlers
+
+
+def get_tool_names() -> list[str]:
+    """Return list of registered tool names (for status display)."""
+    return list(ACTIONS.keys())
+
+
+# ═══════════════════════════════════════════════════════════════
+# Workspace scoping — all file paths are relative to this root
+# ═══════════════════════════════════════════════════════════════
+
+def _workspace_dir() -> str:
+    """Return the workspace root directory. All file operations are scoped here."""
+    from .config import get
+    ws = os.environ.get("ELY_WORKSPACE", "")
+    if not ws:
+        ws = get("tools", "workspace", os.getcwd())
+    return os.path.realpath(os.path.expanduser(ws))
+
+
+def _resolve_path(file_path: str) -> str:
+    """Resolve and validate a path within the workspace.
+    Returns the absolute path, or raises ValueError if it escapes the workspace.
+    """
+    ws = _workspace_dir()
+    # Normalize: remove leading /, resolve ..
+    clean = file_path.lstrip("/").lstrip("\\")
+    # Collapse ../ sequences safely
+    parts = []
+    for p in clean.replace("\\", "/").split("/"):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            if parts:
+                parts.pop()
+            else:
+                raise ValueError(f"Path escapes workspace: {file_path}")
+        else:
+            parts.append(p)
+    resolved = os.path.realpath(os.path.join(ws, *parts))
+    # Must be within workspace
+    if not resolved.startswith(ws + os.sep) and resolved != ws:
+        raise ValueError(f"Path escapes workspace: {file_path}")
+    return resolved
+
+
+def _relative_path(abs_path: str) -> str:
+    """Convert absolute path to workspace-relative for display."""
+    ws = _workspace_dir()
+    if abs_path.startswith(ws + os.sep):
+        return abs_path[len(ws) + 1:]
+    elif abs_path == ws:
+        return "."
+    return abs_path
+
+
+# ═══════════════════════════════════════════════════════════════
+# Bash (sandboxed or direct, locked at startup)
+# ═══════════════════════════════════════════════════════════════
+
+SANDBOX_CONTAINER = "ely-sandbox"
+
+
+def _is_sandbox_enabled() -> bool:
+    """Check if bash runs in Docker sandbox. Set at startup, NOT changeable by agent."""
+    from .config import get
+    val = os.environ.get("ELY_BASH_SANDBOX", "")
+    if val:
+        return val.lower() in ("docker", "sandbox", "1", "true", "yes")
+    return get("tools", "bash_sandbox", "direct").lower() in ("docker", "sandbox", "1", "true", "yes")
+
+
+def cleanup_sandbox():
+    """Stop and remove the Docker sandbox container if it exists."""
+    try:
+        r = subprocess.run(
+            ["docker", "inspect", SANDBOX_CONTAINER],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0:
+            subprocess.run(
+                ["docker", "rm", "-f", SANDBOX_CONTAINER],
+                capture_output=True, timeout=10,
+            )
+    except Exception:
+        pass
+
+
+def _run_in_sandbox(command: str, timeout: int = 30) -> str:
+    """Execute a command inside a Docker sandbox container."""
+    container_name = SANDBOX_CONTAINER
+    ws = _workspace_dir()
+    check = subprocess.run(
+        ["docker", "inspect", container_name],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        create = subprocess.run(
+            ["docker", "run", "-d", "--name", container_name,
+             "--rm", "-v", f"{ws}:/workspace", "-w", "/workspace",
+             "--network", "none",  # no network access in sandbox
+             "alpine:latest", "tail", "-f", "/dev/null"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if create.returncode != 0:
+            return f"Error creating sandbox: {create.stderr}"
+
+    result = subprocess.run(
+        ["docker", "exec", "-i", container_name, "sh", "-c", command],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    out = result.stdout
+    if result.stderr:
+        out += f"\n[stderr]\n{result.stderr}"
+    return out[:5000] or f"(exit code {result.returncode})"
+
+
+def _run_direct(command: str, timeout: int = 30) -> str:
+    """Execute a command directly on the host machine."""
+    result = subprocess.run(
+        command, shell=True, capture_output=True, text=True, timeout=timeout,
+        cwd=_workspace_dir(),
+    )
+    out = result.stdout
+    if result.stderr:
+        out += f"\n[stderr]\n{result.stderr}"
+    return out[:5000] or f"(exit code {result.returncode})"
+
+
+@_action("bash", "Execute a shell command in the workspace directory.",
+         {"command": {"type": "string", "description": "The shell command to execute."}})
+def tool_bash(command: str) -> str:
+    try:
+        if _is_sandbox_enabled():
+            return _run_in_sandbox(command)
+        else:
+            return _run_direct(command)
+    except subprocess.TimeoutExpired:
+        return "Error: command timed out (30s)"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Diary — agent's persistent memory across sessions
+# ═══════════════════════════════════════════════════════════════
+
+def _diary_dir() -> str:
+    from .config import get
+    d = os.path.join(os.path.expanduser(get("memory", "dir", "~/.ely/memory")), "diary")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _load_diary() -> list:
+    """Load all diary entries from individual JSON files, sorted by ID."""
+    d = _diary_dir()
+    entries = []
+    for name in sorted(os.listdir(d)):
+        if name.endswith(".json"):
+            try:
+                with open(os.path.join(d, name)) as f:
+                    entry = json.load(f)
+                    if isinstance(entry, dict) and "id" in entry:
+                        entries.append(entry)
+            except Exception:
+                pass
+    entries.sort(key=lambda e: e.get("id", 0))
+    return entries
+
+
+def _save_entry(entry: dict):
+    """Save a single diary entry to its own JSON file."""
+    d = _diary_dir()
+    path = os.path.join(d, f"{entry['id']}.json")
+    with open(path, "w") as f:
+        json.dump(entry, f, indent=2)
+
+
+def _next_diary_id() -> int:
+    """Get the next available diary entry ID."""
+    entries = _load_diary()
+    if not entries:
+        return 1
+    return max(e.get("id", 0) for e in entries) + 1
+
+
+def _migrate_old_diary():
+    """Migrate from old diary.json to individual files."""
+    from .config import get
+    old_path = os.path.join(os.path.expanduser(get("memory", "dir", "~/.ely/memory")), "diary.json")
+    if os.path.isfile(old_path):
+        try:
+            with open(old_path) as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                for entry in data:
+                    _save_entry(entry)
+            os.rename(old_path, old_path + ".migrated")
+        except Exception:
+            pass
+
+
+@_action("diary_add", "Add an entry to the persistent diary. Use to remember facts, decisions, or context.",
+         {"content": {"type": "string", "description": "The diary entry text. Be specific — what should be remembered and why."},
+          "tags": {"type": "string", "description": "Comma-separated tags for searching (e.g. 'bug,security,python')."}},
+         optional=["tags"])
+def tool_diary_add(content: str, tags: str = "") -> str:
+    import time
+    _migrate_old_diary()
+    entry = {
+        "id": _next_diary_id(),
+        "content": content,
+        "tags": [t.strip() for t in tags.split(",") if t.strip()],
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    _save_entry(entry)
+    return f"Diary entry #{entry['id']} saved."
+
+
+@_action("diary_list", "List recent diary entries.",
+         {"limit": {"type": "integer", "description": "Max entries to return (default 20)."}},
+         optional=["limit"])
+def tool_diary_list(limit: int = 20) -> str:
+    _migrate_old_diary()
+    entries = _load_diary()
+    if not entries:
+        return "Diary is empty."
+    recent = entries[-limit:]
+    lines = [f"Diary ({len(entries)} entries, showing last {len(recent)}):"]
+    for e in reversed(recent):
+        tags = f" [{', '.join(e.get('tags', []))}]" if e.get("tags") else ""
+        lines.append(f"  #{e['id']} [{e['timestamp']}]{tags}")
+        lines.append(f"    {e['content'][:200]}")
+    return "\n".join(lines)
+
+
+@_action("diary_search", "Search diary entries by text or tags.",
+         {"query": {"type": "string", "description": "Search query (matched against content and tags)."}})
+def tool_diary_search(query: str) -> str:
+    _migrate_old_diary()
+    entries = _load_diary()
+    q = query.lower()
+    matches = []
+    for e in entries:
+        content_match = q in e.get("content", "").lower()
+        tag_match = any(q in t.lower() for t in e.get("tags", []))
+        if content_match or tag_match:
+            matches.append(e)
+    if not matches:
+        return f"No diary entries matching '{query}'."
+    lines = [f"Found {len(matches)} matching entries:"]
+    for e in reversed(matches[-15:]):
+        tags = f" [{', '.join(e.get('tags', []))}]" if e.get("tags") else ""
+        lines.append(f"  #{e['id']} [{e['timestamp']}]{tags}")
+        lines.append(f"    {e['content'][:300]}")
+    return "\n".join(lines)
+
+
+@_action("diary_get", "Read a specific diary entry by ID.",
+         {"entry_id": {"type": "integer", "description": "The diary entry ID to read."}})
+def tool_diary_get(entry_id: int) -> str:
+    _migrate_old_diary()
+    d = _diary_dir()
+    path = os.path.join(d, f"{entry_id}.json")
+    if os.path.isfile(path):
+        try:
+            with open(path) as f:
+                e = json.load(f)
+            tags = f" [{', '.join(e.get('tags', []))}]" if e.get("tags") else ""
+            return f"#{e['id']} [{e['timestamp']}]{tags}\n\n{e['content']}"
+        except Exception:
+            pass
+    return f"Diary entry #{entry_id} not found."
+
+
+# ═══════════════════════════════════════════════════════════════
+# File tools — scoped to workspace
+# ═══════════════════════════════════════════════════════════════
+
+@_action("read_file", "Read a file within the workspace.",
+         {"file_path": {"type": "string", "description": "Path relative to workspace root."},
+          "limit": {"type": "integer", "description": "Max lines to read (default 200)."}},
+         optional=["limit"])
+def tool_read_file(file_path: str, limit: int = 200) -> str:
+    try:
+        path = _resolve_path(file_path)
+    except ValueError as e:
+        return f"Error: {e}"
+    if not os.path.isfile(path):
+        return f"Error: file not found: {file_path}"
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+        total = len(lines)
+        content = "".join(lines[:limit])
+        rel = _relative_path(path)
+        result = f"{rel} ({min(total, limit)}/{total} lines)\n```\n{content}```"
+        return result[:8000]
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@_action("write_file", "Write content to a markdown file within the workspace. All output is forced to .md extension.",
+         {"file_path": {"type": "string", "description": "Path relative to workspace root. Extension is forcibly replaced with .md."},
+          "content": {"type": "string", "description": "Markdown content to write."}})
+def tool_write_file(file_path: str, content: str) -> str:
+    # Force .md extension — strip any existing extension, append .md
+    base = os.path.splitext(file_path)[0]
+    if not base:
+        base = "untitled"
+    file_path = base + ".md"
+    try:
+        path = _resolve_path(file_path)
+    except ValueError as e:
+        return f"Error: {e}"
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            f.write(content)
+        rel = _relative_path(path)
+        return f"Written {len(content)} chars to {rel}"
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@_action("list_directory", "List files and directories within the workspace.",
+         {"path": {"type": "string", "description": "Directory path relative to workspace (default: root)."}},
+         optional=["path"])
+def tool_list_directory(path: str = ".") -> str:
+    try:
+        target = _resolve_path(path) if path else _workspace_dir()
+    except ValueError as e:
+        return f"Error: {e}"
+    if not os.path.isdir(target):
+        return f"Error: not a directory: {path}"
+    try:
+        entries = sorted(os.listdir(target))
+        files = []
+        dirs = []
+        for e in entries:
+            if e.startswith("."):
+                continue
+            full = os.path.join(target, e)
+            if os.path.isdir(full):
+                dirs.append(e + "/")
+            else:
+                size = os.path.getsize(full)
+                files.append(f"{e} ({_fmt_size(size)})")
+        rel = _relative_path(target)
+        lines = [f"📁 {rel}"]
+        if dirs:
+            lines.append("[Dirs]")
+            lines.extend(f"  {d}" for d in dirs[:25])
+        if files:
+            lines.append("[Files]")
+            lines.extend(f"  {f}" for f in files[:40])
+        lines.append(f"\n{len(dirs)} dirs, {len(files)} files")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {e}"
+
+
+@_action("grep", "Search for a regex pattern in workspace files.",
+         {"pattern": {"type": "string", "description": "Regex pattern to search for (case-insensitive)."},
+          "path": {"type": "string", "description": "Subdirectory to search in (default: entire workspace)."}},
+         optional=["path"])
+def tool_grep(pattern: str, path: str = ".") -> str:
+    try:
+        target = _resolve_path(path) if path else _workspace_dir()
+    except ValueError as e:
+        return f"Error: {e}"
+
+    try:
+        pat = re.compile(pattern, re.IGNORECASE)
+    except Exception:
+        pat = re.compile(re.escape(pattern), re.IGNORECASE)
+
+    results = []
+    skip_dirs = {".git", "node_modules", "__pycache__", "venv", ".venv", "dist", "build", ".ely"}
+
+    if os.path.isfile(target):
+        files = [target]
+    elif os.path.isdir(target):
+        files = []
+        for root, dirs, filenames in os.walk(target):
+            dirs[:] = [d for d in dirs if d not in skip_dirs]
+            for fn in filenames:
+                if fn.startswith("."):
+                    continue
+                fp = os.path.join(root, fn)
+                if os.path.getsize(fp) > 1_000_000:  # skip >1MB files
+                    continue
+                files.append(fp)
+    else:
+        return f"Error: path not found: {path}"
+
+    for fp in files:
+        try:
+            with open(fp, "r", errors="replace") as f:
+                for i, line in enumerate(f, 1):
+                    if pat.search(line):
+                        rel = _relative_path(fp)
+                        results.append(f"{rel}:{i}: {line.strip()[:200]}")
+                        if len(results) >= 15:
+                            break
+            if len(results) >= 15:
+                break
+        except Exception:
+            pass
+
+    if not results:
+        return f"No matches for '{pattern}'"
+    return "\n".join(results[:15])
+
+
+# ═══════════════════════════════════════════════════════════════
+# Sub-agent tools — spawn independent worker agents for parallel tasks
+# ═══════════════════════════════════════════════════════════════
+
+@_action("task", "Spawn a sub-agent to handle a task independently. The sub-agent runs in parallel and returns its result. Use for research, exploration, or analysis that doesn't need the main conversation.",
+         {"description": {"type": "string", "description": "Task description for the sub-agent. Be specific about what to do and what to return."},
+          "context": {"type": "string", "description": "Context for the sub-agent: default, code, sysadmin, research"}},
+         optional=["context"])
+def tool_task(description: str, context: str = "default") -> str:
+    """Run a single sub-agent and return its result."""
+    try:
+        from .subagent import SubAgent
+        agent = SubAgent(description, context=context)
+        agent.start()
+        result = agent.wait(timeout=120)
+        if result is None:
+            return "Sub-agent timed out after 120s."
+        reply = result.get("reply", "")
+        actions = result.get("actions", [])
+        tokens = result.get("tokens", {})
+        out = reply
+        if actions:
+            out += f"\n\n[Actions: {', '.join(actions)}]"
+        if tokens.get("total", 0) > 0:
+            out += f"\n[Tokens: {tokens['total']:,}]"
+        return out
+    except Exception as e:
+        return f"Sub-agent error: {e}"
+
+
+@_action("task_parallel", "Spawn multiple sub-agents to handle tasks in parallel. Each sub-agent works independently. Use for parallel research, multi-file analysis, or independent explorations.",
+         {"tasks": {"type": "string", "description": "JSON array of {task: description, context: default|code|sysadmin|research}. Example: [{\"task\": \"Read file A\", \"context\": \"code\"}, {\"task\": \"Check disk\", \"context\": \"sysadmin\"}]"}})
+def tool_task_parallel(tasks: str) -> str:
+    """Run multiple sub-agents in parallel and return combined results."""
+    try:
+        tasks_list = json.loads(tasks)
+        if not isinstance(tasks_list, list):
+            return "Error: tasks must be a JSON array"
+
+        from .subagent import SubAgentPool
+        pool = SubAgentPool(max_workers=min(len(tasks_list), 6))
+        results = pool.submit_and_wait(tasks_list)
+
+        lines = []
+        total_tokens = 0
+        for i, r in enumerate(results):
+            task_desc = tasks_list[i].get("task", tasks_list[i].get("description", f"Task {i+1}"))
+            reply = r.get("reply", "No reply")
+            actions = r.get("actions", [])
+            t = r.get("tokens", {})
+            total_tokens += t.get("total", 0)
+
+            lines.append(f"### Sous-agent {i+1}: {task_desc[:80]}")
+            lines.append(reply[:500])
+            if actions:
+                lines.append(f"  [Actions: {', '.join(actions)}]")
+
+        lines.append(f"\n---\nTotal tokens: {total_tokens:,} across {len(results)} sub-agents")
+        return "\n\n".join(lines)
+    except json.JSONDecodeError:
+        return "Error: invalid JSON for tasks parameter"
+    except Exception as e:
+        return f"Sub-agent pool error: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Skill management tools — create and extend agent skills
+# ═══════════════════════════════════════════════════════════════
+
+# Template that all skill tool files must follow.
+# Tools execute bash commands with shell-escaped parameter substitution.
+# This ensures tools respect the sandbox setting and cannot run arbitrary Python.
+
+TOOL_TEMPLATE = '''# Ely skill tool — must follow this template exactly
+NAME = "tool_name"            # Required: [a-z][a-z0-9_]+
+DESCRIPTION = "what it does"  # Required: one-line description
+PARAMETERS = {                # Required: parameters with type/description
+    "arg": {"type": "string", "description": "what this arg does"},
+}
+
+# Option A — Simple: bash command with {param} substitution
+COMMAND = "bash command {arg}"
+
+# Option B — Advanced: Python function with safe builtins + tool_bash()
+def run(tool_bash, **kwargs) -> str:
+    """tool_bash(cmd) runs a sandboxed command and returns stdout.
+    Safe builtins available: str, int, list, dict, json, re, True, False, None."""
+    result = tool_bash(f"echo Processing {kwargs['arg']}")
+    return result.strip()
+
+TIMEOUT = 30  # Optional: 1-120 seconds (default 30)
+'''
+
+import re
+import shlex
+
+_TOOL_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+# Block dangerous calls even inside run() — tools run in a restricted namespace
+_FORBIDDEN_KEYWORDS = [
+    "exec(", "eval(", "compile(",
+    "open(", "subprocess", "popen", "system(",
+    "os.", "sys.", "shutil.", "pathlib.",
+    "globals", "locals", "vars(", "getattr", "setattr", "delattr",
+    "__import__", "__builtins__", "__class__", "__bases__", "__subclasses__",
+    "__dict__", "__globals__", "__code__", "__closure__",
+    "socket.", "http.", "urllib.request", "ftplib",
+]
+
+
+def _validate_tool_content(content: str) -> str | None:
+    """Validate a skill tool file. Returns error message or None if valid."""
+    if len(content) > 16384:
+        return "Tool file too large (max 16KB)"
+
+    content_lower = content.lower()
+    for kw in _FORBIDDEN_KEYWORDS:
+        if kw in content_lower:
+            return f"Forbidden keyword: '{kw}'"
+
+    # Parse in restricted namespace to extract metadata
+    restricted_ns = {"__builtins__": {}}
+    try:
+        exec(content, restricted_ns)
+    except Exception as e:
+        return f"Syntax error: {e}"
+
+    # Validate required fields
+    name = restricted_ns.get("NAME", "")
+    description = restricted_ns.get("DESCRIPTION", "")
+    params = restricted_ns.get("PARAMETERS", {})
+    has_command = bool(restricted_ns.get("COMMAND", ""))
+    has_run = callable(restricted_ns.get("run"))
+
+    if not name or not isinstance(name, str):
+        return "Missing or invalid NAME"
+    if not _TOOL_NAME_RE.match(name):
+        return f"Invalid NAME '{name}': must match [a-z][a-z0-9_]*"
+    if not description or not isinstance(description, str):
+        return "Missing or invalid DESCRIPTION"
+    if not isinstance(params, dict):
+        return "PARAMETERS must be a dict"
+    if not has_command and not has_run:
+        return "Must define either COMMAND or def run(tool_bash, **kwargs)"
+
+    # Validate PARAMETERS
+    for pname, pdef in params.items():
+        if not isinstance(pdef, dict):
+            return f"Parameter '{pname}': must be a dict with 'type' and 'description'"
+        if "type" not in pdef:
+            return f"Parameter '{pname}': missing 'type'"
+        if pdef["type"] not in ("string", "integer", "boolean"):
+            return f"Parameter '{pname}': type must be string, integer, or boolean"
+
+    # Validate COMMAND placeholders if using template mode
+    if has_command:
+        cmd = restricted_ns.get("COMMAND", "")
+        placeholders = set(re.findall(r'\{(\w+)\}', cmd))
+        param_names = set(params.keys())
+        unknown = placeholders - param_names
+        if unknown:
+            return f"COMMAND has unknown placeholders: {', '.join(unknown)}"
+
+    # Check timeout
+    timeout = restricted_ns.get("TIMEOUT", 30)
+    if not isinstance(timeout, (int, float)) or timeout < 1 or timeout > 120:
+        return "TIMEOUT must be 1-120 seconds"
+
+    return None
+
+
+def _skills_user_dir() -> str:
+    """User-level skills directory."""
+    return os.path.join(os.path.expanduser("~"), ".ely", "skills")
+
+
+def _validate_skill_path(base_dir: str, name: str) -> str:
+    """Validate a skill sub-path is safe (no traversal). Returns absolute path."""
+    clean = name.lstrip("/").replace("\\", "/")
+    parts = []
+    for p in clean.split("/"):
+        if p in ("", "."):
+            continue
+        if p == "..":
+            raise ValueError(f"Path traversal denied: {name}")
+        parts.append(p)
+    if not parts:
+        raise ValueError(f"Empty name not allowed")
+    return os.path.join(base_dir, *parts)
+
+
+@_action("skill_create", "Create a new skill directory with SKILL.md. Skills extend the agent's capabilities with custom instructions, tools, and references.",
+         {"name": {"type": "string", "description": "Skill name (slug, e.g. 'my-deploy-skill')."},
+          "description": {"type": "string", "description": "One-line description of what this skill does."},
+          "instructions": {"type": "string", "description": "Markdown instructions that will be injected into the system prompt."}})
+def tool_skill_create(name: str, description: str, instructions: str) -> str:
+    try:
+        skill_dir = _validate_skill_path(_skills_user_dir(), name)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    os.makedirs(skill_dir, exist_ok=True)
+
+    frontmatter = f"---\nname: {name}\ndescription: {description}\n---\n\n"
+    skill_md = os.path.join(skill_dir, "SKILL.md")
+    with open(skill_md, "w") as f:
+        f.write(frontmatter + instructions)
+
+    # Create subdirs
+    for sub in ("tools", "references", "assets"):
+        os.makedirs(os.path.join(skill_dir, sub), exist_ok=True)
+
+    return f"Skill '{name}' created in {skill_dir}"
+
+
+@_action("skill_add_tool", "Add a tool to a skill. Tools execute bash commands with parameter substitution. Must follow the tool template exactly.",
+         {"skill_name": {"type": "string", "description": "The skill to add the tool to."},
+          "tool_filename": {"type": "string", "description": "Python filename (e.g. 'deploy.py'). Must end with .py"},
+          "content": {"type": "string", "description": "Tool definition following the template: NAME, DESCRIPTION, PARAMETERS, COMMAND."}})
+def tool_skill_add_tool(skill_name: str, tool_filename: str, content: str) -> str:
+    if not tool_filename.endswith(".py"):
+        return "Error: tool filename must end with .py"
+
+    # Validate against template before saving
+    error = _validate_tool_content(content)
+    if error:
+        return f"Error: invalid tool — {error}"
+
+    try:
+        skill_dir = _validate_skill_path(_skills_user_dir(), skill_name)
+        tool_path = _validate_skill_path(os.path.join(skill_dir, "tools"), tool_filename)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if not os.path.isdir(skill_dir):
+        return f"Error: skill '{skill_name}' not found. Create it first with skill_create."
+
+    os.makedirs(os.path.dirname(tool_path), exist_ok=True)
+    with open(tool_path, "w") as f:
+        f.write(content)
+
+    # Extract name for confirmation
+    restricted_ns = {"__builtins__": {}}
+    exec(content, restricted_ns)
+    tool_name = restricted_ns.get("NAME", tool_filename)
+
+    return f"Tool '{tool_name}' added to skill '{skill_name}' ({len(content)} bytes)."
+
+
+@_action("skill_add_reference", "Add a reference document to a skill. References provide the agent with domain knowledge or documentation.",
+         {"skill_name": {"type": "string", "description": "The skill to add the reference to."},
+          "ref_name": {"type": "string", "description": "Reference filename (e.g. 'api-docs.md')."},
+          "content": {"type": "string", "description": "Reference content in markdown."}})
+def tool_skill_add_reference(skill_name: str, ref_name: str, content: str) -> str:
+    try:
+        skill_dir = _validate_skill_path(_skills_user_dir(), skill_name)
+        ref_path = _validate_skill_path(os.path.join(skill_dir, "references"), ref_name)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if not os.path.isdir(skill_dir):
+        return f"Error: skill '{skill_name}' not found. Create it first with skill_create."
+
+    os.makedirs(os.path.dirname(ref_path), exist_ok=True)
+    with open(ref_path, "w") as f:
+        f.write(content)
+
+    return f"Reference '{ref_name}' added to skill '{skill_name}' ({len(content)} bytes)."
+
+
+@_action("skill_add_asset", "Add an asset file (template, config, resource) to a skill.",
+         {"skill_name": {"type": "string", "description": "The skill to add the asset to."},
+          "asset_name": {"type": "string", "description": "Asset filename (e.g. 'Dockerfile.tmpl')."},
+          "content": {"type": "string", "description": "Asset file content."}})
+def tool_skill_add_asset(skill_name: str, asset_name: str, content: str) -> str:
+    try:
+        skill_dir = _validate_skill_path(_skills_user_dir(), skill_name)
+        asset_path = _validate_skill_path(os.path.join(skill_dir, "assets"), asset_name)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if not os.path.isdir(skill_dir):
+        return f"Error: skill '{skill_name}' not found. Create it first with skill_create."
+
+    os.makedirs(os.path.dirname(asset_path), exist_ok=True)
+    with open(asset_path, "w") as f:
+        f.write(content)
+
+    return f"Asset '{asset_name}' added to skill '{skill_name}' ({len(content)} bytes)."
+
+
+# ═══════════════════════════════════════════════════════════════
+# Web tools
+# ═══════════════════════════════════════════════════════════════
+
+@_action("web_search", "Search the web for information.",
+         {"query": {"type": "string", "description": "Search query."}})
+def tool_web_search(query: str) -> str:
+    try:
+        import re
+        from html import unescape
+
+        url = "https://html.duckduckgo.com/html/"
+        resp = requests.post(
+            url,
+            data={"q": query},
+            timeout=15,
+            headers={"User-Agent": "Ely-CLI/1.0"},
+        )
+        resp.raise_for_status()
+        html = resp.text
+
+        # Extract results with regex — no external deps
+        results = []
+        for m in re.finditer(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+            html, re.DOTALL | re.IGNORECASE
+        ):
+            link = m.group(1)
+            title = unescape(re.sub(r'<.*?>', '', m.group(2)).strip())
+            snippet = unescape(re.sub(r'<.*?>', '', m.group(3)).strip())
+            if title and link:
+                results.append(f"- [{title}]({link})\n  {snippet[:200]}")
+            if len(results) >= 5:
+                break
+
+        return "\n".join(results) if results else f"No results for: {query}"
+    except Exception as e:
+        return f"Search error: {e}"
+
+
+@_action("web_fetch", "Fetch and extract text content from a URL.",
+         {"url": {"type": "string", "description": "URL to fetch."}})
+def tool_web_fetch(url: str) -> str:
+    try:
+        resp = requests.get(url, timeout=15, headers={"User-Agent": "Ely-CLI/1.0"})
+        resp.raise_for_status()
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header"]):
+            tag.decompose()
+        text = soup.get_text(separator="\n", strip=True)
+        lines = [l for l in text.splitlines() if l.strip()]
+        return "\n".join(lines)[:5000]
+    except ImportError as e:
+        return f"Error: missing package — {e}"
+    except Exception as e:
+        return f"Error fetching {url}: {e}"
+
+
+# ═══════════════════════════════════════════════════════════════
+# Utilities (NOT registered as tools — agent cannot call these)
+# ═══════════════════════════════════════════════════════════════
+
+def get_workspace_info() -> str:
+    """Return workspace info for the system prompt."""
+    ws = _workspace_dir()
+    sandbox = "docker" if _is_sandbox_enabled() else "direct"
+    return f"Workspace: {ws} | Bash: {sandbox}"
+
+
+def get_diary_context(limit: int = 5) -> str:
+    """Return recent diary entries for inclusion in the system prompt."""
+    entries = _load_diary()
+    if not entries:
+        return ""
+    recent = entries[-limit:]
+    lines = ["\n**Diary (connaissances sauvegardées par l'utilisateur) :**"]
+    for e in reversed(recent):
+        tags = f" [{', '.join(e.get('tags', []))}]" if e.get("tags") else ""
+        lines.append(f"- [#{e['id']}] {e['content'][:150]}{tags}")
+    return "\n".join(lines)
+
+
+def _fmt_size(size: int) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{size:.0f}{unit}"
+        size /= 1024
+    return f"{size:.0f}TB"
