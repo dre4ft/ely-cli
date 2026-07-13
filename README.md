@@ -1,17 +1,70 @@
-# Ely — Standalone CLI AI Agent
+# Ely — CLI AI Agent
 
-Agent IA en ligne de commande avec TUI cockpit, extrait de l'Ely Copilot d'Elyria.
+Agent IA en ligne de commande avec function calling, skills extensibles et sous-agents parallèles.
 
-## Installation
+## Quick start
 
 ```bash
-cd ely-cli
 pip install -r requirements.txt
+cp ely.yaml.example ely.yaml   # édite la clé API
+python cli.py
+```
+
+## Usage
+
+```bash
+python cli.py                      # REPL interactif
+python cli.py "explique asyncio"   # Single-shot
+python cli.py --context code       # Contexte spécifique
+python cli.py --sandbox docker     # Sandbox Docker
+python cli.py --tui                # Interface TUI (optionnelle)
+```
+
+## REPL
+
+```
+Ely · deepseek-v4-flash · ctx: code · bash: direct · 📁 ely-cli
+#commande = bash direct | /help = aide | Tab = autocompléter
+
+› #ls -la               # commande bash directe
+› /skill activate osint # activer une compétence
+› analyse ce fichier    # message → agent
+```
+
+| Input | Action |
+|---|---|
+| `#cmd` | Bash direct (pas de LLM) |
+| `Tab` | Autocomplétion |
+| `/help` | Toutes les commandes |
+
+## Skills
+
+Dossiers dans `~/.ely/skills/` ou `./skills/` :
+
+```
+mon-skill/
+├── SKILL.md          # Instructions pour l'agent
+├── tools/            # Outils Python
+├── references/       # Documentation
+└── assets/           # Templates
+```
+
+Outil template :
+```python
+NAME = "docker_push"
+DESCRIPTION = "Push une image Docker"
+PARAMETERS = {"image": {"type": "string", "description": "Nom"}}
+COMMAND = "docker push {image}"
+```
+
+Outil Python :
+```python
+def run(tool_bash, **kwargs):
+    output = tool_bash(f"wc -l {kwargs['path']}")
+    return f"Lines: {output.split()[0]}"
 ```
 
 ## Configuration
-
-Crée `~/.ely/config.yaml` ou `./ely.yaml` :
 
 ```yaml
 provider:
@@ -19,95 +72,25 @@ provider:
   model: gpt-4o-mini
   url: https://api.openai.com/v1
   api_key: "sk-..."
-```
 
-Ou `export OPENAI_API_KEY=sk-...`
-
-### Providers
-- **openai** — OpenAI, Azure, DeepSeek, ou toute API compatible
-- **ollama** — Modèles locaux (`url: http://localhost:11434`)
-- **lmstudio** — LM Studio local (`url: http://localhost:1234/v1`)
-
-## Usage
-
-```bash
-# Mode cockpit TUI (défaut)
-python cli.py
-
-# Question unique
-python cli.py "explique comment fonctionne asyncio"
-
-# Mode REPL simple
-python cli.py --no-tui
-
-# Mode Pro
-python cli.py --pro "analyse ce code"
-
-# Bash en sandbox Docker
-python cli.py --sandbox docker
-```
-
-### Raccourcis TUI cockpit
-
-| Touche | Action |
-|--------|--------|
-| `Enter` | Envoyer |
-| `Ctrl+P` | Pro / Flash |
-| `Ctrl+C` | Cycle contexte |
-| `Ctrl+L` | Effacer l'écran |
-| `Ctrl+Q` | Quitter |
-| `F1` | Aide |
-
-### Commandes slash
-
-`/explain` `/fix` `/refactor` `/test` `/context` `/pro` `/flash` `/tokens` `/clear`
-
-## Débrayabilité bash : sandbox vs direct
-
-Le bash tool peut s'exécuter en mode **direct** (sur la machine hôte) ou **sandbox** (conteneur Docker isolé).
-
-```bash
-# Au lancement
-python cli.py --sandbox docker
-
-# Dans l'agent, via un tool
-toggle_sandbox(mode="docker")
-toggle_sandbox(mode="direct")
-```
-
-Config permanent dans `ely.yaml` :
-```yaml
 tools:
-  bash_sandbox: docker   # ou "direct"
+  bash_sandbox: direct   # direct ou docker
+  disabled: ""           # "bash, bash_batch" → sans shell
+
+mcp:
+  servers: []            # Serveurs MCP (stdio ou SSE)
 ```
 
 ## Structure
 
 ```
-ely-cli/
-├── cli.py              # Entrée CLI (TUI cockpit, REPL, single-shot)
-├── ely/
-│   ├── agent.py         # Boucle agent + function calling
-│   ├── config.py        # Configuration YAML + env vars
-│   ├── providers.py     # OpenAI, Ollama, LM Studio
-│   ├── tools.py         # 8 outils (bash, fichiers, web, sandbox)
-│   ├── tui.py           # Interface cockpit Textual
-│   ├── prompts.py       # Templates de prompts
-│   ├── guard.py         # Filtre anti-injection
-│   ├── memory.py        # Mémoire + compaction LLM
-│   ├── skills.py        # Chargement de skills markdown
-│   └── skills/
-│       └── ely.md       # Skill principal
-├── requirements.txt
-└── ely.yaml.example
+ely/
+├── agent.py         # Boucle function calling
+├── tools.py         # 21 outils natifs
+├── subagent.py      # Sous-agents parallèles
+├── skills.py        # Skills directory-based
+├── mcp.py           # Client MCP
+├── contexts.py      # Contextes persistés
+├── memory.py        # Mémoire + compaction
+└── providers.py     # OpenAI, Ollama, LM Studio
 ```
-
-## Différences avec l'Elyria Copilot
-
-- **TUI cockpit** — interface terminal sobre et efficace (Textual)
-- **Pas de base de données** — mémoire en fichiers JSON
-- **Pas de FastAPI** — pas de serveur web
-- **Pas d'auth** — usage local
-- **Outils génériques** — bash, fichiers, web
-- **Débrayabilité sandbox** — toggle Docker/direct au runtime
-- **Code épuré** — ~900 lignes vs ~5000+ dans Elyria
