@@ -23,6 +23,7 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape as rich_escape
 from rich.live import Live
+from rich.rule import Rule
 from rich.text import Text
 from rich.table import Table
 
@@ -439,7 +440,7 @@ def single_shot(query: str, context: str = "default", slot: str = "provider"):
         )
 
 
-def repl(context: str = "", slot: str = "provider"):
+def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
     """Simple REPL mode without full TUI."""
     history = _load_history()
     total_tokens = {"prompt": 0, "completion": 0, "total": 0}
@@ -467,8 +468,12 @@ def repl(context: str = "", slot: str = "provider"):
 
     _setup_readline()
 
-    console.print(f"[bold]Ely[/] · {cfg['model']} · ctx: {context} · bash: {sandbox} · 📁 {ws}{skill_status}")
-    console.print("[dim]#commande = bash direct | /help = aide | Tab = autocompléter | exit = quitter[/]\n")
+    if classic_ui:
+        console.print(f"[bold]Ely[/] · {cfg['model']} · ctx: {context} · bash: {sandbox} · 📁 {ws}{skill_status}")
+        console.print("[dim]#commande = bash direct | /help = aide | Tab = autocompléter | exit = quitter[/]\n")
+    else:
+        console.print(f"[bold]Ely[/]  [dim]{cfg['model']}[/]  [dim]ctx={context}[/]  [dim]bash={sandbox}[/]  [dim]📁 {ws}{'  ' + skill_status if skill_status else ''}[/]")
+        console.print(Rule(style="dim"))
 
     while True:
         try:
@@ -615,18 +620,40 @@ def repl(context: str = "", slot: str = "provider"):
         history.append({"role": "assistant", "content": reply})
         _save_history(history)
 
-        # Sticky header
-        skill_line = build_skills_status_line()
-        h = f"Ely · {result.get('model', cfg['model'])} · ctx: {context} · bash: {sandbox} · 📁 {ws}"
-        if skill_line:
-            h += f" · {skill_line}"
-        console.print(f"[dim]{h}[/]")
+        if classic_ui:
+            # ── Classic UI ──
+            skill_line = build_skills_status_line()
+            h = f"Ely · {result.get('model', cfg['model'])} · ctx: {context} · bash: {sandbox} · 📁 {ws}"
+            if skill_line:
+                h += f" · {skill_line}"
+            console.print(f"[dim]{h}[/]")
+            console.print()
+            console.print(Markdown(reply))
+            if actions:
+                console.print(f"[dim]🔧 {', '.join(actions)} | 🪙 {t.get('total', 0):,} tokens[/]")
+            console.print()
+        else:
+            # ── Claude Code-like UI ──
+            from ely.ui import reasoning_panel, reply_header, reply_body, footer
 
-        console.print()
-        console.print(Markdown(reply))
-        if actions:
-            console.print(f"[dim]🔧 {', '.join(actions)} | 🪙 {t.get('total', 0):,} tokens[/]")
-        console.print()
+            if reasoning:
+                reasoning_panel(reasoning)
+
+            skill_line = build_skills_status_line()
+            reply_header(
+                model=result.get('model', cfg['model']),
+                context=context,
+                skill=skill_line,
+                tokens=t.get('total', 0),
+            )
+            reply_body(reply)
+            footer(
+                model=result.get('model', cfg['model']),
+                context=context,
+                skill=skill_line,
+                tokens=total_tokens['total'],
+                actions=actions,
+            )
 
 
 def main():
@@ -635,6 +662,7 @@ def main():
     parser.add_argument("--config", default="", help="Path to ely.yaml config file")
     parser.add_argument("--tui", action="store_true", default=False, help="TUI cockpit mode")
     parser.add_argument("--no-tui", action="store_true", help="Simple REPL mode (default)")
+    parser.add_argument("--classic", action="store_true", default=False, help="Classic UI (original rendering)")
     parser.add_argument("--context", default="default", help="Context (default, code, sysadmin, research)")
     parser.add_argument("--pro", action="store_true", help="Use pro provider")
     parser.add_argument("--model", default="", help="Override model")
@@ -667,7 +695,7 @@ def main():
     elif query:
         single_shot(query, context, slot)
     else:
-        repl(context, slot)
+        repl(context, slot, classic_ui=args.classic)
 
 
 if __name__ == "__main__":
