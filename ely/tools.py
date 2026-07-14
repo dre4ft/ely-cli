@@ -50,6 +50,55 @@ def _action(name: str, description: str, parameters: dict, optional: list = None
     return decorator
 
 
+# Tool categories for dynamic selection
+TOOL_CATEGORIES = {
+    "files": {"read_file", "write_file", "edit_file", "list_directory", "grep"},
+    "bash": {"bash", "bash_batch"},
+    "web": {"web_search", "web_fetch", "http_request", "http_batch", "socket_raw"},
+    "diary": {"diary_add", "diary_list", "diary_search", "diary_get"},
+    "skills": {"skill_create", "skill_add_tool", "skill_add_reference", "skill_add_asset", "skill_reference_list", "skill_reference_get", "custom_tool_add", "custom_tool_list"},
+    "tasks": {"task", "task_poll", "task_list", "task_parallel"},
+}
+
+CATEGORY_KEYWORDS = {
+    "web": ["http", "api", "url", "rest", "curl", "web", "site", "page", "recherche", "search", "fetch", "internet", "en ligne", "online", "browser", "navigateur", "cve", "vuln", "ssti", "xss", "csrf", "cors", "jwt", "injection", "flag", "ctf", "root-me", "challenge", "endpoint", "request", "response", "header", "cookie"],
+    "diary": ["souvenir", "retenir", "mémoire", "memoire", "diary", "note", "sauvegarde", "rappelle", "oublie", "flag", "résultat", "important", "CTF"],
+    "skills": ["skill", "compétence", "competence", "créer un outil", "nouvel outil", "nouveau skill", "créer un skill"],
+    "tasks": ["parallèle", "parallele", "plusieurs fichiers", "sous-agent", "subagent", "background", "en même temps", "simultané", "chaque fichier", "tous les"],
+}
+
+
+def _get_dynamic_tool_names(message: str, history: list = None) -> set[str]:
+    """Determine which tool categories are relevant for a message.
+    Always includes files + bash. Adds others based on keyword matching.
+    Returns empty set to signal 'all tools'."""
+    msg_lower = message.lower() if message else ""
+
+    # Always include core tools (files + bash)
+    active = set(TOOL_CATEGORIES["files"]) | set(TOOL_CATEGORIES["bash"])
+
+    # Check each category
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if category in ("files", "bash"):
+            continue
+        if any(kw in msg_lower for kw in keywords):
+            active |= set(TOOL_CATEGORIES.get(category, set()))
+
+    # If there's conversation history, broaden to all tools
+    if history and len(history) > 2:
+        return set()
+
+    # Always include custom tools, skill tools, and MCP tools (they're user-defined)
+    # Add all tools that aren't in any category
+    all_categorized = set()
+    for tools in TOOL_CATEGORIES.values():
+        all_categorized |= tools
+    all_native = set(ACTIONS.keys())
+    active |= (all_native - all_categorized)
+
+    return active
+
+
 def _get_disabled_tools() -> set[str]:
     """Read disabled tools from config."""
     from .config import get
@@ -299,7 +348,7 @@ def _run_in_sandbox(command: str, timeout: int = 30) -> str:
     out = result.stdout
     if result.stderr:
         out += f"\n[stderr]\n{result.stderr}"
-    return out[:5000] or f"(exit code {result.returncode})"
+    return out[:3000] or f"(exit code {result.returncode})"
 
 
 def _run_direct(command: str, timeout: int = 30) -> str:
@@ -311,7 +360,7 @@ def _run_direct(command: str, timeout: int = 30) -> str:
     out = result.stdout
     if result.stderr:
         out += f"\n[stderr]\n{result.stderr}"
-    return out[:5000] or f"(exit code {result.returncode})"
+    return out[:3000] or f"(exit code {result.returncode})"
 
 
 @_action("bash", "Execute a shell command in the workspace directory.",
@@ -517,7 +566,7 @@ def tool_read_file(file_path: str, limit: int = 200) -> str:
         content = "".join(lines[:limit])
         rel = _relative_path(path)
         result = f"{rel} ({min(total, limit)}/{total} lines)\n```\n{content}```"
-        return result[:8000]
+        return result[:4000]
     except Exception as e:
         return f"Error: {e}"
 
@@ -1291,7 +1340,7 @@ def tool_web_fetch(url: str) -> str:
             tag.decompose()
         text = soup.get_text(separator="\n", strip=True)
         lines = [l for l in text.splitlines() if l.strip()]
-        return "\n".join(lines)[:5000]
+        return "\n".join(lines)[:3000]
     except ImportError as e:
         return f"Error: missing package — {e}"
     except Exception as e:
@@ -1331,7 +1380,7 @@ def tool_http_request(url: str, method: str = "GET", headers: str = "{}",
             out_lines.append(f"  {k}: {v}")
         # Response body (truncated)
         out_lines.append(f"\n--- Response Body ({len(resp.text)} chars) ---")
-        out_lines.append(resp.text[:4000])
+        out_lines.append(resp.text[:2000])
 
         return "\n".join(out_lines)
     except ImportError:

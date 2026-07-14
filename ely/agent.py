@@ -6,7 +6,7 @@ Extracted and adapted from ely/agent.py.
 import json
 from .providers import create_provider
 from .config import get_provider_config, get_int, get, get_bool
-from .tools import get_tools, get_workspace_info, get_diary_context
+from .tools import get_tools, get_workspace_info, get_diary_context, _get_dynamic_tool_names
 from .guard import sanitize
 from .skills import build_skills_prompt
 from .prompts import BASE_PROMPT, SLASH_PROMPTS
@@ -124,16 +124,20 @@ def chat(
     except Exception:
         pass
 
-    # Get tools (native + MCP)
-    tool_defs, tool_handlers = get_tools()
+    # Get tools — dynamically filter based on message, broaden on later turns
+    dynamic_names = _get_dynamic_tool_names(clean_msg, history)
+    if dynamic_names:
+        tool_defs, tool_handlers = get_tools(names=dynamic_names)
+    else:
+        tool_defs, tool_handlers = get_tools()
 
     # Build messages with conversation history
     messages = [{"role": "system", "content": system_prompt}]
-    for h in history[-15:]:
+    for h in history[-10:]:
         role = h.get("role", "user")
         content = h.get("content", "")
         if role in ("user", "assistant"):
-            messages.append({"role": role, "content": str(content)[:4000]})
+            messages.append({"role": role, "content": str(content)[:2500]})
     messages.append({"role": "user", "content": clean_msg})
 
     max_turns = get_int("agent", "max_turns", 8)
@@ -151,6 +155,10 @@ def chat(
     reply = ""
     all_reasoning = []
     for turn in range(max_turns):
+        # Broaden tools after first turn — agent might need any tool
+        if turn == 1 and dynamic_names:
+            tool_defs, tool_handlers = get_tools()
+            dynamic_names = None
         if status_cb:
             status_cb("thinking", f"Réflexion... (tour {turn + 1}/{max_turns})")
         try:
