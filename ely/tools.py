@@ -58,6 +58,7 @@ TOOL_CATEGORIES = {
     "diary": {"diary_add", "diary_list", "diary_search", "diary_get"},
     "skills": {"skill_create", "skill_add_tool", "skill_add_reference", "skill_add_asset", "skill_reference_list", "skill_reference_get", "custom_tool_add", "custom_tool_list"},
     "tasks": {"task", "task_poll", "task_list", "task_parallel"},
+    "contexts": {"context_list", "context_create", "context_get"},
 }
 
 CATEGORY_KEYWORDS = {
@@ -65,6 +66,7 @@ CATEGORY_KEYWORDS = {
     "diary": ["souvenir", "retenir", "mémoire", "memoire", "diary", "note", "sauvegarde", "rappelle", "oublie", "flag", "résultat", "important", "CTF"],
     "skills": ["skill", "compétence", "competence", "créer un outil", "nouvel outil", "nouveau skill", "créer un skill"],
     "tasks": ["parallèle", "parallele", "plusieurs fichiers", "sous-agent", "subagent", "background", "en même temps", "simultané", "chaque fichier", "tous les"],
+    "contexts": ["context", "contexte", "mode", "profil"],
 }
 
 
@@ -1281,6 +1283,43 @@ def tool_skill_add_asset(skill_name: str, asset_name: str, content: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════
+# Context tools — manage agent contexts
+# ═══════════════════════════════════════════════════════════════
+
+@_action("context_list", "List all available contexts.",
+         {})
+def tool_context_list() -> str:
+    from .contexts import list_contexts
+    ctxs = list_contexts()
+    if not ctxs:
+        return "No contexts found."
+    lines = ["Available contexts:"]
+    for c in ctxs:
+        lines.append(f"  - {c['name']}: {c.get('description', '')}")
+    return "\n".join(lines)
+
+
+@_action("context_create", "Create a new custom context. Contexts define the agent's behavior and focus.",
+         {"name": {"type": "string", "description": "Context name (slug, e.g. 'ctf', 'pentest')."},
+          "description": {"type": "string", "description": "One-line description of this context."},
+          "prompt": {"type": "string", "description": "Instructions for the agent when this context is active."}})
+def tool_context_create(name: str, description: str, prompt: str) -> str:
+    from .contexts import create_context
+    path = create_context(name, description, prompt)
+    return f"Context '{name}' created at {path}. Activate with /context activate {name}."
+
+
+@_action("context_get", "Get the full content of a context.",
+         {"name": {"type": "string", "description": "Context name."}})
+def tool_context_get(name: str) -> str:
+    from .contexts import get_context
+    ctx = get_context(name)
+    if not ctx:
+        return f"Context '{name}' not found."
+    return f"**{name}** — {ctx.get('description', '')}\n\n{ctx.get('prompt', '')}"
+
+
 # Web tools
 # ═══════════════════════════════════════════════════════════════
 

@@ -48,7 +48,7 @@ COMMANDS = {
     "/tokens":     ("Afficher le total de tokens consommés", None),
     "/clear":      ("Effacer l'historique de conversation", None),
     "/diary":      ("Gérer le diary persistant", ["list", "add", "search", "get"]),
-    "/skill":      ("Gérer les compétences", ["list", "activate", "deactivate"]),
+    "/skill":      ("Gérer les compétences", ["list", "activate", "deactivate", "delete"]),
     "/mcp":        ("Gérer les serveurs MCP connectés", ["list", "reload"]),
     "/subagent":   ("Gérer les sous-agents en arrière-plan", ["list", "kill"]),
     "/help":       ("Afficher cette aide", None),
@@ -122,7 +122,7 @@ def _command_completer(text: str, state: int) -> str | None:
 
     # Case 3: completing second argument — "/skill activate <TAB>"
     elif n_parts == 2 and trailing_space:
-        if cmd == "/skill" and parts[1] in ("activate", "deactivate"):
+        if cmd == "/skill" and parts[1] in ("activate", "deactivate", "delete"):
             from ely.skills import list_skills
             matches = list_skills()
         elif cmd == "/context" and parts[1] in ("activate",):
@@ -137,7 +137,7 @@ def _command_completer(text: str, state: int) -> str | None:
 
     # Case 4: completing second argument with partial — "/skill activate pen<TAB>"
     elif n_parts == 3 and not trailing_space:
-        if cmd == "/skill" and parts[1] in ("activate", "deactivate"):
+        if cmd == "/skill" and parts[1] in ("activate", "deactivate", "delete"):
             from ely.skills import list_skills
             matches = [s for s in list_skills() if s.startswith(parts[2].lower())]
         elif cmd == "/context" and parts[1] in ("activate",):
@@ -251,8 +251,22 @@ def _handle_skill(user_input: str):
             console.print(f"[dim]✓ Compétence '{name}' désactivée.[/]")
         else:
             console.print(f"[red]Impossible de désactiver '{name}' (introuvable ou compétence de base).[/]")
+    elif sub.startswith("delete "):
+        name = sub[7:].strip()
+        if name == "ely":
+            console.print("[red]Impossible de supprimer la compétence de base 'ely'.[/]")
+            return
+        import shutil
+        from ely.tools import _skills_user_dir
+        skill_dir = os.path.join(_skills_user_dir(), name)
+        if not os.path.isdir(skill_dir):
+            console.print(f"[red]Compétence '{name}' introuvable.[/]")
+            return
+        deactivate_skill(name)
+        shutil.rmtree(skill_dir)
+        console.print(f"[dim]✓ Compétence '{name}' supprimée.[/]")
     else:
-        console.print("[cyan]/skill [list] | /skill activate <nom> | /skill deactivate <nom>[/]")
+        console.print("[cyan]/skill [list] | /skill activate <nom> | /skill deactivate <nom> | /skill delete <nom>[/]")
 
 
 def _handle_mcp(user_input: str):
@@ -468,15 +482,26 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
 
     _setup_readline()
 
-    if classic_ui:
-        console.print(f"[bold]Ely[/] · {cfg['model']} · ctx: {context} · bash: {sandbox} · 📁 {ws}{skill_status}")
-        console.print("[dim]#commande = bash direct | /help = aide | Tab = autocompléter | exit = quitter[/]\n")
-    else:
-        console.print(f"[bold]Ely[/]  [dim]{cfg['model']}[/]  [dim]ctx={context}[/]  [dim]bash={sandbox}[/]  [dim]📁 {ws}{'  ' + skill_status if skill_status else ''}[/]")
-        console.print(Rule(style="dim"))
+    def _status_footer():
+        """Print persistent status footer before the input prompt."""
+        model = get_provider_config(slot)["model"]
+        sk = build_skills_status_line()
+        sandbox_label = "sandbox" if _is_sandbox_enabled() else "direct"
+        wspace = os.path.basename(_workspace_dir())
+        if classic_ui:
+            parts = [f"[bold]Ely[/] · [cyan]{model}[/] · ctx: [green]{context}[/] · bash: [yellow]{sandbox_label}[/] · 📁 [blue]{wspace}[/]"]
+        else:
+            parts = [f"[bold]Ely[/]  [cyan]{model}[/]  ctx=[green]{context}[/]  bash=[yellow]{sandbox_label}[/]  📁 [blue]{wspace}[/]"]
+        if sk:
+            parts.append(sk)
+        parts.append("[dim]🪙 {:,}[/]".format(total_tokens['total']))
+        return " · ".join(parts)
+
+    console.print("[dim]#commande | /help | Tab | exit[/]")
 
     while True:
         try:
+            console.print(f"[dim]{_status_footer()}[/]")
             user_input = console.input("[bold green]›[/] ").strip()
             if user_input:
                 _save_readline_history()
@@ -622,38 +647,22 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
 
         if classic_ui:
             # ── Classic UI ──
-            skill_line = build_skills_status_line()
-            h = f"Ely · {result.get('model', cfg['model'])} · ctx: {context} · bash: {sandbox} · 📁 {ws}"
-            if skill_line:
-                h += f" · {skill_line}"
-            console.print(f"[dim]{h}[/]")
             console.print()
             console.print(Markdown(reply))
             if actions:
-                console.print(f"[dim]🔧 {', '.join(actions)} | 🪙 {t.get('total', 0):,} tokens[/]")
+                console.print(f"[dim]🔧 {', '.join(actions)}  🪙 {t.get('total', 0):,}[/]")
             console.print()
         else:
             # ── Claude Code-like UI ──
-            from ely.ui import reasoning_panel, reply_header, reply_body, footer
+            from ely.ui import reasoning_panel, reply_body
 
             if reasoning:
                 reasoning_panel(reasoning)
 
-            skill_line = build_skills_status_line()
-            reply_header(
-                model=result.get('model', cfg['model']),
-                context=context,
-                skill=skill_line,
-                tokens=t.get('total', 0),
-            )
             reply_body(reply)
-            footer(
-                model=result.get('model', cfg['model']),
-                context=context,
-                skill=skill_line,
-                tokens=total_tokens['total'],
-                actions=actions,
-            )
+            if actions:
+                console.print(f"[dim]🔧 {'  '.join(actions)}  🪙 {t.get('total', 0):,}[/]")
+            console.print()
 
 
 def main():
