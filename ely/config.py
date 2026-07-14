@@ -11,7 +11,7 @@ _DEFAULTS = {
     "provider": {
         "type": "openai",  # openai, ollama, lmstudio
         "model": "gpt-4o-mini",
-        "url": "https://api.openai.com/v1",
+        "url": "",  # Auto-detected from type if empty
         "api_key": "",
     },
     "pro_provider": {

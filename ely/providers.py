@@ -10,15 +10,17 @@ from openai import OpenAI, DefaultHttpxClient
 class OpenAIProvider:
     """OpenAI-compatible provider (works with OpenAI, LM Studio, DeepSeek, etc.)."""
 
-    def __init__(self, model: str, url: str = "https://api.openai.com/v1", api_key: str = ""):
+    def __init__(self, model: str, url: str, api_key: str = ""):
         self.model = model
         self.url = url
         http_client = DefaultHttpxClient(verify=False)
+        # Only use "not-needed" for local servers, pass empty otherwise
+        is_local = "localhost" in url or "127.0.0.1" in url
+        key = api_key if api_key else ("not-needed" if is_local else "sk-no-key")
+        headers = {}
         if "litellm" in url:
-            header = {"x-litellm-api-key":api_key}
-            self.client = OpenAI(base_url=url, api_key=api_key or "not-needed",http_client=http_client,default_headers=header)
-        else:
-            self.client = OpenAI(base_url=url, api_key=api_key or "not-needed",http_client=http_client)
+            headers["x-litellm-api-key"] = api_key or "not-needed"
+        self.client = OpenAI(base_url=url, api_key=key, http_client=http_client, default_headers=headers)
 
     def chat(self, messages: list, tools: list = None) -> dict:
         kwargs = {"model": self.model, "messages": messages}
@@ -126,17 +128,20 @@ def create_provider(config: dict):
     """
     ptype = config.get("type", "openai").lower()
     model = config.get("model", "gpt-4o-mini")
+    url = config.get("url", "")
+
+    # Auto-select URL based on type if not explicitly configured
+    if not url:
+        if ptype == "ollama":
+            url = "http://localhost:11434"
+        elif ptype == "lmstudio":
+            url = "http://localhost:1234/v1"
+        else:
+            url = "https://api.openai.com/v1"
 
     if ptype == "ollama":
-        return OllamaProvider(model=model, host=config.get("url", "http://localhost:11434"))
+        return OllamaProvider(model=model, host=url)
     elif ptype == "lmstudio":
-        # LM Studio is OpenAI-compatible
-        return OpenAIProvider(model=model, url=config.get("url", "http://localhost:1234/v1"), api_key="not-needed")
+        return OpenAIProvider(model=model, url=url, api_key="lm-studio")
     else:
-        
-        # openai or any OpenAI-compatible endpoint
-        return OpenAIProvider(
-            model=model,
-            url=config.get("url", "https://api.openai.com/v1"),
-            api_key=config.get("api_key", ""),
-        )
+        return OpenAIProvider(model=model, url=url, api_key=config.get("api_key", ""))
