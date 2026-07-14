@@ -172,6 +172,20 @@ class SubAgent:
     def done(self) -> bool:
         return self._done.is_set()
 
+    def cancel(self):
+        """Cancel the sub-agent. Sets a cancelled result."""
+        self.result = {
+            "reply": "Task cancelled by user.",
+            "actions": [],
+            "tokens": {},
+            "model": "cancelled",
+        }
+        self._done.set()
+
+    def close(self):
+        """Cancel and clean up the sub-agent."""
+        self.cancel()
+
 
 class SubAgentPool:
     """Manages multiple sub-agents running in parallel."""

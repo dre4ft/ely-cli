@@ -23,9 +23,8 @@ from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape as rich_escape
 from rich.live import Live
-from rich.panel import Panel
-from rich.table import Table
 from rich.text import Text
+from rich.table import Table
 
 from ely.agent import chat
 from ely.config import get, get_provider_config, get_bool
@@ -50,6 +49,7 @@ COMMANDS = {
     "/diary":      ("Gérer le diary persistant", ["list", "add", "search", "get"]),
     "/skill":      ("Gérer les compétences", ["list", "activate", "deactivate"]),
     "/mcp":        ("Gérer les serveurs MCP connectés", ["list", "reload"]),
+    "/subagent":   ("Gérer les sous-agents en arrière-plan", ["list", "kill"]),
     "/help":       ("Afficher cette aide", None),
 }
 
@@ -107,8 +107,13 @@ def _command_completer(text: str, state: int) -> str | None:
     # Case 1: completing command name — "/sk<TAB>" → "/skill"
     if n_parts == 1 and not trailing_space:
         matches = [c for c in COMMANDS if c.startswith(text.lower())]
+    # Case 1b: command typed, space pressed — show subcommands — "/skill <TAB>"
+    elif n_parts == 1 and trailing_space:
+        sub = COMMANDS.get(cmd, (None, None))[1]
+        if sub:
+            matches = sub
 
-    # Case 2: completing first argument (subcommand) — "/skill <TAB>"
+    # Case 2: completing first argument (subcommand) — "/skill l<TAB>"
     elif n_parts == 2 and not trailing_space:
         sub = COMMANDS.get(cmd, (None, None))[1]
         if sub:
@@ -124,6 +129,10 @@ def _command_completer(text: str, state: int) -> str | None:
             matches = [c["name"] for c in list_contexts()]
         elif cmd == "/diary" and parts[1] == "search":
             pass  # free-form, no completion
+        elif cmd == "/subagent" and parts[1] == "kill":
+            from ely.tools import _background_tasks, _task_lock
+            with _task_lock:
+                matches = [str(tid) for tid in _background_tasks]
 
     # Case 4: completing second argument with partial — "/skill activate pen<TAB>"
     elif n_parts == 3 and not trailing_space:
@@ -133,6 +142,10 @@ def _command_completer(text: str, state: int) -> str | None:
         elif cmd == "/context" and parts[1] in ("activate",):
             from ely.contexts import list_contexts
             matches = [c["name"] for c in list_contexts() if c["name"].startswith(parts[2].lower())]
+        elif cmd == "/subagent" and parts[1] == "kill":
+            from ely.tools import _background_tasks, _task_lock
+            with _task_lock:
+                matches = [str(tid) for tid in _background_tasks if str(tid).startswith(parts[2])]
 
     try:
         return matches[state]
@@ -289,6 +302,60 @@ def _handle_mcp(user_input: str):
             console.print(f"[red]Erreur MCP: {e}[/]")
     else:
         console.print("[cyan]/mcp [list] | /mcp reload[/]")
+
+
+def _handle_subagent(user_input: str):
+    """Handle /subagent commands — manage background sub-agents."""
+    from ely.tools import _background_tasks, _task_lock
+
+    parts = user_input.split(maxsplit=1)
+    sub = parts[1].strip() if len(parts) > 1 else ""
+
+    if not sub or sub == "list":
+        with _task_lock:
+            if not _background_tasks:
+                console.print("[dim]Aucun sous-agent en cours.[/]")
+                return
+            console.print(f"[bold]Sous-agents ({len(_background_tasks)}) :[/]")
+            import time as _t
+            for tid, t in sorted(_background_tasks.items()):
+                agent = t.get("agent")
+                if agent and agent.done:
+                    icon, status = "[green]✓[/]", "terminé"
+                else:
+                    elapsed = _t.time() - t.get("started", 0)
+                    icon, status = "[yellow]⏳[/]", f"en cours ({elapsed:.0f}s)"
+                console.print(f"  {icon} [cyan]#{tid}[/] {status}: {t['desc'][:80]}")
+    elif sub.startswith("kill "):
+        try:
+            tid = int(sub[5:].strip())
+        except ValueError:
+            console.print("[red]Usage: /subagent kill <id>[/]")
+            return
+        with _task_lock:
+            t = _background_tasks.get(tid)
+        if not t:
+            console.print(f"[red]Sous-agent #{tid} introuvable.[/]")
+            return
+        agent = t.get("agent")
+        if agent and not agent.done:
+            try:
+                agent.close()
+            except Exception:
+                pass
+            with _task_lock:
+                _background_tasks.pop(tid, None)
+            console.print(f"[dim]✓ Sous-agent #{tid} killed.[/]")
+        elif agent and agent.done:
+            with _task_lock:
+                _background_tasks.pop(tid, None)
+            console.print(f"[dim]✓ Sous-agent #{tid} déjà terminé, nettoyé.[/]")
+        else:
+            with _task_lock:
+                _background_tasks.pop(tid, None)
+            console.print(f"[dim]✓ Sous-agent #{tid} nettoyé.[/]")
+    else:
+        console.print("[cyan]/subagent [list] | /subagent kill <id>[/]")
 
 
 def _handle_context(user_input: str, current_context: str) -> str:
@@ -460,6 +527,9 @@ def repl(context: str = "", slot: str = "provider"):
             if cmd.startswith("/mcp"):
                 _handle_mcp(user_input)
                 continue
+            if cmd.startswith("/subagent"):
+                _handle_subagent(user_input)
+                continue
             if cmd.startswith("/context"):
                 context = _handle_context(user_input, context)
                 continue
@@ -484,42 +554,42 @@ def repl(context: str = "", slot: str = "provider"):
 
         history.append({"role": "user", "content": user_input})
 
+        # ── Call agent with live status display ──
+        import time as _t
+        _start = _t.time()
+        _current_action = ""
+        _current_tool = ""
+        _current_result = ""
+        _reasoning_snippet = ""
+        _turn_info = ""
+
+        def _status_cb(event, data):
+            nonlocal _current_action, _current_tool, _current_result, _reasoning_snippet, _turn_info
+            if event == "thinking":
+                _turn_info = data
+            elif event == "reasoning":
+                _reasoning_snippet = data[-250:]
+            elif event == "tool_call":
+                _current_tool = data[:100]
+                _current_result = ""
+            elif event == "tool_result":
+                _current_result = data[:120]
+            elif event == "reply":
+                _current_action = "✅ Réponse"
+
         try:
-            # Live status display — shows current agent activity only
-            import time as _time
-            _start = _time.time()
-            current_action = ""
-            current_tool = ""
-            current_result = ""
-            reasoning_snippet = ""
-            turn_info = ""
-
-            def status_cb(event, data):
-                nonlocal current_action, current_tool, current_result, reasoning_snippet, turn_info
-                if event == "thinking":
-                    turn_info = data
-                elif event == "reasoning":
-                    reasoning_snippet = data[-250:]
-                elif event == "tool_call":
-                    current_tool = data[:100]
-                    current_result = ""
-                elif event == "tool_result":
-                    current_result = data[:120]
-                elif event == "reply":
-                    current_action = "✅ Réponse"
-
             with Live(Text("🤔 Réflexion...", style="dim"), refresh_per_second=8, transient=True) as live:
-                def update_live(event, data):
-                    status_cb(event, data)
-                    elapsed = _time.time() - _start
-                    parts = [Text.from_markup(f"[dim]⏱ {elapsed:.0f}s · {rich_escape(turn_info or 'Réflexion...')}[/]", overflow="ellipsis")]
-                    if reasoning_snippet:
-                        short = rich_escape(reasoning_snippet.replace("\n", " ")[-200:])
+                def _update_live(event, data):
+                    _status_cb(event, data)
+                    elapsed = _t.time() - _start
+                    parts = [Text.from_markup(f"[dim]⏱ {elapsed:.0f}s · {rich_escape(_turn_info or 'Réflexion...')}[/]", overflow="ellipsis")]
+                    if _reasoning_snippet:
+                        short = rich_escape(_reasoning_snippet.replace("\n", " ")[-200:])
                         parts.append(Text.from_markup(f"[dim]💭 {short}[/]", overflow="ellipsis"))
-                    if current_tool:
-                        parts.append(Text.from_markup(f"[cyan]🔧 {rich_escape(current_tool)}[/]", overflow="ellipsis"))
-                    if current_result:
-                        parts.append(Text.from_markup(f"[dim]   ⮡ {rich_escape(current_result)}[/]", overflow="ellipsis"))
+                    if _current_tool:
+                        parts.append(Text.from_markup(f"[cyan]🔧 {rich_escape(_current_tool)}[/]", overflow="ellipsis"))
+                    if _current_result:
+                        parts.append(Text.from_markup(f"[dim]   ⮡ {rich_escape(_current_result)}[/]", overflow="ellipsis"))
                     live.update(Text("\n").join(parts))
 
                 result = chat(
@@ -527,14 +597,11 @@ def repl(context: str = "", slot: str = "provider"):
                     history=history[:-1],
                     context=context,
                     slot=slot,
-                    status_cb=update_live,
+                    status_cb=_update_live,
                 )
         except (KeyboardInterrupt, EOFError):
             console.print("\n[dim]Interrompu.[/]")
-            from ely.tools import cleanup_sandbox
-            cleanup_sandbox()
-            # Don't save partial interaction
-            history.pop()  # remove the user message we just added
+            history.pop()
             continue
 
         reply = result.get("reply", "")
@@ -548,15 +615,7 @@ def repl(context: str = "", slot: str = "provider"):
         history.append({"role": "assistant", "content": reply})
         _save_history(history)
 
-        # Show condensed reasoning if available (collapsed, 3 lines max)
-        if reasoning:
-            lines = reasoning.strip().split("\n")
-            preview = rich_escape("\n".join(lines[:3]))
-            if len(lines) > 3:
-                preview += f"\n[dim]... ({len(lines)} lignes)[/]"
-            console.print(Panel(Text.from_markup(preview), title="💭 Réflexion", border_style="dim", padding=(0, 1)))
-
-        # Sticky header before each reply
+        # Sticky header
         skill_line = build_skills_status_line()
         h = f"Ely · {result.get('model', cfg['model'])} · ctx: {context} · bash: {sandbox} · 📁 {ws}"
         if skill_line:
@@ -566,10 +625,7 @@ def repl(context: str = "", slot: str = "provider"):
         console.print()
         console.print(Markdown(reply))
         if actions:
-            console.print(
-                f"[dim]🔧 {', '.join(actions)} | "
-                f"🪙 {t.get('total', 0):,} tokens[/]"
-            )
+            console.print(f"[dim]🔧 {', '.join(actions)} | 🪙 {t.get('total', 0):,} tokens[/]")
         console.print()
 
 

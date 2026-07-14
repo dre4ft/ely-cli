@@ -545,6 +545,72 @@ def tool_write_file(file_path: str, content: str) -> str:
         return f"Error: {e}"
 
 
+@_action("edit_file", "Edit a file within the workspace. Replace or delete specific line ranges, or insert after a line.",
+         {"file_path": {"type": "string", "description": "Path relative to workspace root."},
+          "action": {"type": "string", "description": "Action: replace_line, replace_range, insert_after, delete_range."},
+          "start_line": {"type": "integer", "description": "Line number (1-based). For replace_line: the line to replace."},
+          "end_line": {"type": "integer", "description": "End line number (inclusive). For replace_range and delete_range."},
+          "new_content": {"type": "string", "description": "New content. For replace_*: replacement text. For insert_after: lines to insert."}},
+         optional=["end_line", "new_content"])
+def tool_edit_file(file_path: str, action: str, start_line: int,
+                   end_line: int = 0, new_content: str = "") -> str:
+    try:
+        path = _resolve_path(file_path)
+    except ValueError as e:
+        return f"Error: {e}"
+
+    if not os.path.isfile(path):
+        return f"Error: file not found: {file_path}"
+
+    try:
+        with open(path, "r", errors="replace") as f:
+            lines = f.readlines()
+
+        total = len(lines)
+        if start_line < 1 or start_line > total:
+            return f"Error: start_line {start_line} out of range (1-{total})"
+
+        if action == "replace_line":
+            lines[start_line - 1] = new_content + "\n"
+
+        elif action == "replace_range":
+            if end_line < start_line or end_line > total:
+                return f"Error: invalid range {start_line}-{end_line} (file has {total} lines)"
+            replacement = (new_content + "\n").splitlines(True)
+            for i in range(len(replacement)):
+                if not replacement[i].endswith("\n"):
+                    replacement[i] += "\n"
+            lines[start_line - 1:end_line] = replacement
+
+        elif action == "insert_after":
+            insertion = (new_content + "\n").splitlines(True)
+            for i in range(len(insertion)):
+                if not insertion[i].endswith("\n"):
+                    insertion[i] += "\n"
+            for i, line in enumerate(insertion):
+                lines.insert(start_line + i, line)
+
+        elif action == "delete_range":
+            if end_line < start_line or end_line > total:
+                return f"Error: invalid range {start_line}-{end_line} (file has {total} lines)"
+            del lines[start_line - 1:end_line]
+
+        else:
+            return f"Error: unknown action '{action}'. Use: replace_line, replace_range, insert_after, delete_range."
+
+        with open(path, "w") as f:
+            f.writelines(lines)
+
+        rel = _relative_path(path)
+        new_total = len(lines)
+        return f"Edited {rel}: {action} at line {start_line}" + \
+               (f"-{end_line}" if end_line else "") + \
+               f" ({total} → {new_total} lines)"
+
+    except Exception as e:
+        return f"Error: {e}"
+
+
 @_action("list_directory", "List files and directories within the workspace.",
          {"path": {"type": "string", "description": "Directory path relative to workspace (default: root)."}},
          optional=["path"])
@@ -636,68 +702,138 @@ def tool_grep(pattern: str, path: str = ".") -> str:
 
 
 # ═══════════════════════════════════════════════════════════════
-# Sub-agent tools — spawn independent worker agents for parallel tasks
+# Sub-agent tools — background workers with callback pattern
 # ═══════════════════════════════════════════════════════════════
 
-@_action("task", "Spawn a sub-agent to handle a task independently. The sub-agent runs in parallel and returns its result. Use for research, exploration, or analysis that doesn't need the main conversation.",
-         {"description": {"type": "string", "description": "Task description for the sub-agent. Be specific about what to do and what to return."},
-          "context": {"type": "string", "description": "Context for the sub-agent: default, code, sysadmin, research"}},
+import threading
+import time as _time_module
+
+_background_tasks: dict[int, dict] = {}
+_task_id_counter = 0
+_task_lock = threading.Lock()
+
+
+def _get_background_results() -> str:
+    """Called before each agent turn — injects completed task results.
+    Returns empty string if no tasks completed."""
+    completed = []
+    with _task_lock:
+        for tid, t in list(_background_tasks.items()):
+            agent = t.get("agent")
+            if agent and agent.done:
+                result = agent.result or {"reply": "No result", "actions": [], "tokens": {}}
+                completed.append(f"[Task #{tid} completed] {t['desc'][:80]}\n{result.get('reply', '')[:500]}")
+                del _background_tasks[tid]
+
+    if completed:
+        return "\n\n".join(completed)
+    return ""
+
+
+@_action("task", "Spawn a sub-agent to run in BACKGROUND. Returns immediately with a task ID. The sub-agent works independently — call task_poll(id) later to check if it's done and get results. Use for non-blocking parallel work.",
+         {"description": {"type": "string", "description": "Task description. Be specific about what to do and return."},
+          "context": {"type": "string", "description": "Context: default, code, sysadmin, research"}},
          optional=["context"])
 def tool_task(description: str, context: str = "default") -> str:
-    """Run a single sub-agent and return its result."""
+    """Spawn a background sub-agent. Non-blocking."""
+    global _task_id_counter
     try:
         from .subagent import SubAgent
+
+        with _task_lock:
+            _task_id_counter += 1
+            tid = _task_id_counter
+
         agent = SubAgent(description, context=context)
         agent.start()
-        result = agent.wait(timeout=120)
-        if result is None:
-            return "Sub-agent timed out after 120s."
-        reply = result.get("reply", "")
-        actions = result.get("actions", [])
-        tokens = result.get("tokens", {})
-        out = reply
-        if actions:
-            out += f"\n\n[Actions: {', '.join(actions)}]"
-        if tokens.get("total", 0) > 0:
-            out += f"\n[Tokens: {tokens['total']:,}]"
-        return out
+
+        with _task_lock:
+            _background_tasks[tid] = {"agent": agent, "desc": description, "started": _time_module.time()}
+
+        return f"Task #{tid} started in background: {description[:100]}\nCall task_poll({tid}) to check if done, or task_list to see all running tasks."
     except Exception as e:
         return f"Sub-agent error: {e}"
 
 
-@_action("task_parallel", "Spawn multiple sub-agents to handle tasks in parallel. Each sub-agent works independently. Use for parallel research, multi-file analysis, or independent explorations.",
-         {"tasks": {"type": "string", "description": "JSON array of {task: description, context: default|code|sysadmin|research}. Example: [{\"task\": \"Read file A\", \"context\": \"code\"}, {\"task\": \"Check disk\", \"context\": \"sysadmin\"}]"}})
+@_action("task_poll", "Check the status of a background task. If the task is done, returns its result. If still running, returns its status.",
+         {"task_id": {"type": "integer", "description": "Task ID returned by task()"}})
+def tool_task_poll(task_id: int) -> str:
+    """Check a background task's status."""
+    with _task_lock:
+        t = _background_tasks.get(task_id)
+
+    if not t:
+        return f"Task #{task_id} not found. It may have already been retrieved or never existed."
+
+    agent = t.get("agent")
+    if not agent:
+        return f"Task #{task_id}: internal error."
+
+    if not agent.done:
+        elapsed = _time_module.time() - t.get("started", 0)
+        return f"Task #{task_id} still running ({elapsed:.0f}s): {t['desc'][:100]}"
+
+    # Task done — retrieve result and remove
+    result = agent.result or {"reply": "No result", "actions": [], "tokens": {}}
+    with _task_lock:
+        del _background_tasks[task_id]
+
+    reply = result.get("reply", "")
+    actions = result.get("actions", [])
+    tokens = result.get("tokens", {})
+    out = f"Task #{task_id} completed:\n{reply}"
+    if actions:
+        out += f"\n\n[Actions: {', '.join(actions)}]"
+    if tokens.get("total", 0) > 0:
+        out += f"\n[Tokens: {tokens['total']:,}]"
+    return out
+
+
+@_action("task_list", "List all background tasks and their status.",
+         {})
+def tool_task_list() -> str:
+    """List background tasks."""
+    with _task_lock:
+        if not _background_tasks:
+            return "No background tasks running."
+        lines = [f"{len(_background_tasks)} background task(s):"]
+        for tid, t in _background_tasks.items():
+            agent = t.get("agent")
+            status = "done" if (agent and agent.done) else "running"
+            elapsed = _time_module.time() - t.get("started", 0)
+            lines.append(f"  #{tid} [{status}] ({elapsed:.0f}s): {t['desc'][:80]}")
+        return "\n".join(lines)
+
+
+@_action("task_parallel", "Spawn MULTIPLE sub-agents in background. Returns immediately with task IDs. Use task_poll(id) to collect results.",
+         {"tasks": {"type": "string", "description": "JSON array: [{\"task\": \"desc\", \"context\": \"default\"}]"}})
 def tool_task_parallel(tasks: str) -> str:
-    """Run multiple sub-agents in parallel and return combined results."""
+    """Spawn multiple background sub-agents. Non-blocking."""
+    global _task_id_counter
     try:
         tasks_list = json.loads(tasks)
         if not isinstance(tasks_list, list):
             return "Error: tasks must be a JSON array"
-
-        from .subagent import SubAgentPool
-        pool = SubAgentPool(max_workers=min(len(tasks_list), 6))
-        results = pool.submit_and_wait(tasks_list)
-
-        lines = []
-        total_tokens = 0
-        for i, r in enumerate(results):
-            task_desc = tasks_list[i].get("task", tasks_list[i].get("description", f"Task {i+1}"))
-            reply = r.get("reply", "No reply")
-            actions = r.get("actions", [])
-            t = r.get("tokens", {})
-            total_tokens += t.get("total", 0)
-
-            lines.append(f"### Sous-agent {i+1}: {task_desc[:80]}")
-            lines.append(reply[:500])
-            if actions:
-                lines.append(f"  [Actions: {', '.join(actions)}]")
-
-        lines.append(f"\n---\nTotal tokens: {total_tokens:,} across {len(results)} sub-agents")
-        return "\n\n".join(lines)
     except json.JSONDecodeError:
-        return "Error: invalid JSON for tasks parameter"
-    except Exception as e:
-        return f"Sub-agent pool error: {e}"
+        return "Error: invalid JSON for tasks"
+
+    ids = []
+    for t in tasks_list:
+        desc = t.get("task", t.get("description", "Unknown"))
+        ctx = t.get("context", "default")
+        try:
+            from .subagent import SubAgent
+            agent = SubAgent(desc, context=ctx)
+            agent.start()
+            with _task_lock:
+                _task_id_counter += 1
+                tid = _task_id_counter
+                _background_tasks[tid] = {"agent": agent, "desc": desc, "started": _time_module.time()}
+            ids.append(str(tid))
+        except Exception as e:
+            ids.append(f"error:{e}")
+
+    return f"{len(ids)} tasks started in background: IDs {', '.join(ids)}\nUse task_poll(<id>) to check each, task_list to see all."
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -829,10 +965,100 @@ def _extract_tools_from_module(mod) -> tuple[list[dict], callable]:
 
     return tools, handle_tool
 
-import re
-import shlex
 
-_TOOL_NAME_RE = re.compile(r'^[a-z][a-z0-9_]*$')
+def _parse_params_from_description(description: str) -> dict:
+    """Extract parameters from description text like 'Params: name (required), path (default: .)'.
+    Returns OpenAI parameters schema dict."""
+    import re
+    params_match = re.search(r'Params?:\s*(.+)', description, re.IGNORECASE)
+    if not params_match:
+        return None
+
+    properties = {}
+    required = []
+    params_text = params_match.group(1)
+
+    # Split on , but not inside ()
+    parts = re.split(r',\s*(?![^(]*\))', params_text)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # Extract: name (required) or name (default: value) or name
+        m = re.match(r'(\w+)\s*(?:\((.+)\))?', part)
+        if not m:
+            continue
+        pname = m.group(1)
+        detail = (m.group(2) or "").lower()
+
+        is_required = "required" in detail
+        default = None
+        if not is_required:
+            dm = re.search(r'default:\s*["\']?([^"\')\]]+)', detail)
+            if dm:
+                default = dm.group(1).strip().strip('"').strip("'")
+
+        properties[pname] = {
+            "type": "string",
+            "description": f"Parameter: {pname}" + (f" (default: {default})" if default else ""),
+        }
+        if is_required:
+            required.append(pname)
+
+    if not properties:
+        return None
+
+    return {
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    } if required else {
+        "type": "object",
+        "properties": properties,
+    }
+
+
+def _normalize_tool_def(tool: dict) -> dict | None:
+    """Normalize a tool definition to OpenAI format.
+    Accepts simple {"name": ..., "description": ...} with optional "parameters".
+    Parses 'Params: ...' from description if no explicit parameters."""
+    if "type" in tool and "function" in tool:
+        return tool
+
+    name = tool.get("name", "")
+    if not name:
+        return None
+
+    description = tool.get("description", "")
+
+    # Use explicit parameters if provided
+    params = tool.get("parameters")
+    if not params:
+        # Try to parse from description
+        params = _parse_params_from_description(description)
+        # Strip the Params: suffix from description if we parsed it
+        if params and "Params:" in description:
+            description = description.split("Params:")[0].strip().rstrip(".")
+
+    if not params:
+        params = {"type": "object", "properties": {}}
+
+    # Wrap bare properties dict into OpenAI schema
+    if "type" not in params:
+        props = params
+        required = [k for k, v in props.items() if isinstance(v, dict) and v.get("required")]
+        params = {"type": "object", "properties": props}
+        if required:
+            params["required"] = required
+
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": params,
+        },
+    }
 # Block dangerous calls even inside run() — tools run in a restricted namespace
 # Keywords blocked in tool source. Each is checked as a WORD (not substring).
 # "localStorage" won't match "locals", "evaluate" won't match "eval", etc.
@@ -941,6 +1167,37 @@ def tool_skill_add_reference(skill_name: str, ref_name: str, content: str) -> st
         f.write(content)
 
     return f"Reference '{ref_name}' added to skill '{skill_name}' ({len(content)} bytes)."
+
+
+@_action("skill_reference_list", "List reference documents available for the active skill.",
+         {})
+def tool_skill_reference_list() -> str:
+    from .skills import get_active_skills, load_skill
+    active = get_active_skills()
+    expert = next((n for n in active if n != "ely"), None)
+    if not expert:
+        return "No active skill. Activate one with /skill activate."
+    skill = load_skill(expert)
+    if not skill or not skill.references:
+        return f"No references for skill '{expert}'."
+    return f"References for '{expert}':\n" + "\n".join(f"  - {r}" for r in skill.references)
+
+
+@_action("skill_reference_get", "Read a specific reference document from the active skill. Use when you need methodology, payloads, or domain knowledge.",
+         {"ref_name": {"type": "string", "description": "Reference filename (e.g. 'methodology.md', 'sources.md', 'xss-payloads.md')."}})
+def tool_skill_reference_get(ref_name: str) -> str:
+    from .skills import get_active_skills, load_skill, read_skill_reference
+    active = get_active_skills()
+    expert = next((n for n in active if n != "ely"), None)
+    if not expert:
+        return "No active skill."
+    skill = load_skill(expert)
+    if not skill:
+        return f"Skill '{expert}' not found."
+    content = read_skill_reference(expert, ref_name)
+    if content is None:
+        return f"Reference '{ref_name}' not found. Available: {', '.join(skill.references)}"
+    return content
 
 
 @_action("skill_add_asset", "Add an asset file (template, config, resource) to a skill.",

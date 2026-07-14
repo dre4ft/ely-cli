@@ -138,6 +138,15 @@ def chat(
 
     max_turns = get_int("agent", "max_turns", 8)
 
+    # Inject completed background task results before each agent call
+    try:
+        from .tools import _get_background_results
+        bg_results = _get_background_results()
+        if bg_results:
+            messages.append({"role": "user", "content": f"[Background tasks completed]\n{bg_results}"})
+    except Exception:
+        pass
+
     # ── Function-calling loop ──
     reply = ""
     all_reasoning = []

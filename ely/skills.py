@@ -335,7 +335,8 @@ def build_skills_prompt() -> str:
                 tool_names = [t[:-3] for t in skill.tools]
                 lines.append(f"\n**Outils spécialisés :** {', '.join(tool_names)}")
             if skill.references:
-                lines.append(f"**Références :** {', '.join(skill.references)}")
+                lines.append(f"\n**Références disponibles :** {', '.join(skill.references)}")
+                lines.append("Utilise skill_reference_list pour les lister, skill_reference_get pour lire une référence.")
 
         # Base skill in secondary position
         if base and "ely" in active:

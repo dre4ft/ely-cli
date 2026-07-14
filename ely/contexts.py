@@ -52,7 +52,7 @@ def _ensure_defaults():
         },
         "research": {
             "description": "Mode recherche — web et documentation",
-            "prompt": "L'utilisateur fait de la recherche. Utilise web_search et web_fetch pour trouver des informations récentes. Synthétise et cite tes sources.",
+            "prompt": "L'utilisateur fait de la recherche. Utilise les fichiers du workspace, web_search et web_fetch pour trouver des informations récentes. Synthétise et cite tes sources.",
         },
     }
 
