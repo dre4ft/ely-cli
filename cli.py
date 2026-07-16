@@ -170,8 +170,9 @@ def _show_help():
     console.print()
     console.print(table)
     console.print()
+    console.print("[bold]?<question>[/] [dim]— Question rapide au LLM (sans outils, sans agent)[/]")
     console.print("[bold]#<commande>[/] [dim]— Exécute une commande bash directement (sandbox ou terminal)[/]")
-    console.print("[dim]LLM = envoyé à l'agent | Tab = autocomplétion | [/][bold]#[/] [dim]= bash direct[/]")
+    console.print("[dim]LLM = envoyé à l'agent | Tab = autocomplétion[/]")
 
 
 def _load_history():
@@ -497,7 +498,7 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
         parts.append("[dim]🪙 {:,}[/]".format(total_tokens['total']))
         return " · ".join(parts)
 
-    console.print("[dim]#commande | /help | Tab | exit[/]")
+    console.print("[dim]?question = LLM sans tools | #commande = bash | /help | Tab | exit[/]")
 
     while True:
         try:
@@ -520,6 +521,23 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
             from ely.tools import cleanup_sandbox
             cleanup_sandbox()
             break
+
+        # ── Quick LLM query: ?question → no tools, text only ──
+        if user_input.startswith("?"):
+            query = user_input[1:].strip()
+            if query:
+                from ely.providers import create_provider
+                provider = create_provider(get_provider_config(slot))
+                console.print("[dim]🤔 Réflexion...[/]")
+                try:
+                    resp = provider.chat(
+                        messages=[{"role": "user", "content": query}],
+                        tools=None,
+                    )
+                    console.print(Markdown(resp.get("content", "Pas de réponse.")))
+                except Exception as e:
+                    console.print(f"[red]Erreur: {e}[/]")
+            continue
 
         # ── Direct bash command: #ls -la ──
         if user_input.startswith("#"):

@@ -396,18 +396,181 @@ def _sanitize_command(command: str, sandbox: bool = False, block_dotdot: bool = 
     return cmd
 
 
+def _extract_paths(command: str) -> list[str]:
+    """Extract potential file paths from a shell command.
+    Uses shlex to parse, then identifies arguments that look like paths."""
+    import shlex as _shlex
+    try:
+        parts = _shlex.split(command)
+    except ValueError:
+        parts = command.split()
+
+    paths = []
+    for p in parts:
+        # Skip flags, shell operators, assignments
+        if p.startswith('-') or p in ('|', ';', '&&', '||', '>', '>>', '<', '2>', '1>', '&>'):
+            continue
+        if '=' in p and '/' not in p:
+            continue
+        # Heuristic: looks like a path (contains / or . or common extension)
+        if '/' in p or p.startswith('.') or p.endswith(('.txt', '.py', '.js', '.json', '.yaml', '.yml', '.md', '.log', '.csv', '.xml', '.html', '.css', '.sh', '.conf', '.cfg', '.ini', '.env')):
+            paths.append(p)
+        # Also catch bare filenames in obvious file operations
+    return paths
+
+
+def _validate_paths(command: str, workspace: str) -> str | None:
+    """Validate all file paths in a command are within the workspace.
+    Returns error message if a path escapes, None if all OK."""
+    paths = _extract_paths(command)
+    for p in paths:
+        # Resolve the path relative to workspace
+        try:
+            if os.path.isabs(p):
+                resolved = os.path.realpath(p)
+            else:
+                resolved = os.path.realpath(os.path.join(workspace, p))
+        except Exception:
+            continue  # Can't resolve, allow it (might be a URL or special path)
+
+        # Check if within workspace
+        if not resolved.startswith(workspace.rstrip('/') + '/') and resolved != workspace.rstrip('/'):
+            return f"Error: path '{p}' resolves outside workspace ({resolved}). All file operations must stay within the workspace. Use relative paths."
+
+    return None
+
+
 def _run_direct(command: str, timeout: int = 30, sanitize: bool = True) -> str:
     """Execute a command directly on the host machine.
-    When sanitize=True (agent calls): workspace path tokenized, .. blocked."""
+    When sanitize=True (agent calls): paths validated, .. blocked,
+    tokenization, + optional sandbox-exec for defense-in-depth."""
     cmd = _sanitize_command(command, block_dotdot=sanitize) if sanitize else command
+    ws = _workspace_dir()
+
+    if sanitize:
+        # Validate paths are within workspace
+        path_error = _validate_paths(cmd, ws)
+        if path_error:
+            return path_error
+
+    # Defense-in-depth: macOS/Linux sandbox
+    if sanitize and _fs_sandbox_enabled():
+        return _run_fs_sandboxed(cmd, ws, timeout)
+
     result = subprocess.run(
         cmd, shell=True, capture_output=True, text=True, timeout=timeout,
-        cwd=_workspace_dir(),
+        cwd=ws,
     )
     out = result.stdout
     if result.stderr:
         out += f"\n[stderr]\n{result.stderr}"
     return out[:3000] or f"(exit code {result.returncode})"
+
+
+def _fs_sandbox_enabled() -> bool:
+    """Check if filesystem sandbox is available and enabled."""
+    from .config import get_bool
+    return get_bool("tools", "fs_sandbox", True) and _has_sandbox_exec()
+
+
+def _has_sandbox_exec() -> bool:
+    """Check if sandbox-exec (macOS) or bwrap (Linux) is available."""
+    import shutil
+    return shutil.which("sandbox-exec") is not None or shutil.which("bwrap") is not None
+
+
+def _run_fs_sandboxed(cmd: str, workspace: str, timeout: int = 30) -> str:
+    """Execute a command restricted to the workspace filesystem tree.
+    Uses sandbox-exec on macOS, bwrap on Linux."""
+    import shutil
+
+    if shutil.which("sandbox-exec"):
+        return _sandbox_macos(cmd, workspace, timeout)
+    elif shutil.which("bwrap"):
+        return _sandbox_linux(cmd, workspace, timeout)
+    else:
+        # Fallback: no sandbox available
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True, timeout=timeout,
+            cwd=workspace,
+        )
+        out = result.stdout
+        if result.stderr:
+            out += f"\n[stderr]\n{result.stderr}"
+        return out[:3000] or f"(exit code {result.returncode})"
+
+
+def _sandbox_macos(cmd: str, workspace: str, timeout: int = 30) -> str:
+    """macOS sandbox-exec — restrict to workspace."""
+    import tempfile
+    profile = f"""(version 1)
+(allow default)
+(deny file-write* (subpath "/"))
+(allow file-write*
+    (subpath "{workspace}")
+    (subpath "/tmp")
+    (subpath "/var/tmp")
+    (subpath "/dev"))
+(allow process-exec)
+(allow signal (target self))
+(allow process-fork)
+(allow network*)
+"""
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.sb', delete=False) as f:
+        f.write(profile)
+        profile_path = f.name
+    try:
+        result = subprocess.run(
+            ["sandbox-exec", "-f", profile_path, "sh", "-c", cmd],
+            capture_output=True, text=True, timeout=timeout, cwd=workspace,
+        )
+        out = result.stdout.strip()
+        err = result.stderr.strip()
+        if result.returncode != 0:
+            if result.returncode == -6:
+                msg = f"Error: sandbox blocked filesystem access outside workspace ({workspace}). Use relative paths within the workspace."
+            else:
+                msg = f"Error: command failed (exit code {result.returncode})"
+            if out:
+                msg += f"\n{out}"
+            if err:
+                msg += f"\n{err}"
+            return msg
+        if err:
+            out += f"\n[stderr]\n{err}"
+        return out[:3000] if out else "(no output)"
+    finally:
+        try: os.unlink(profile_path)
+        except Exception: pass
+
+
+def _sandbox_linux(cmd: str, workspace: str, timeout: int = 30) -> str:
+    """Linux bwrap — bind workspace as root filesystem."""
+    result = subprocess.run(
+        ["bwrap", "--ro-bind", "/usr", "/usr",
+         "--ro-bind", "/bin", "/bin", "--ro-bind", "/sbin", "/sbin",
+         "--ro-bind", "/lib", "/lib", "--ro-bind", "/lib64", "/lib64",
+         "--ro-bind", "/etc", "/etc",
+         "--bind", workspace, workspace,
+         "--chdir", workspace,
+         "--unshare-all", "--share-net",
+         "--die-with-parent",
+         "sh", "-c", cmd],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    out = result.stdout.strip()
+    err = result.stderr.strip()
+    if result.returncode != 0:
+        if result.returncode == 126 or "denied" in (err or "").lower():
+            msg = f"Error: sandbox blocked access outside workspace ({workspace}). Use relative paths within the workspace."
+        else:
+            msg = f"Error: command failed (exit code {result.returncode})"
+        if out: msg += f"\n{out}"
+        if err: msg += f"\n{err}"
+        return msg
+    if err:
+        out += f"\n[stderr]\n{err}"
+    return out[:3000] if out else "(no output)"
 
 
 @_action("bash", "Execute a shell command in the workspace directory.",

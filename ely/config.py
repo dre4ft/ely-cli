@@ -33,6 +33,7 @@ _DEFAULTS = {
     },
     "tools": {
         "disabled": "",  # Comma-separated tool names to disable, e.g. "bash,web_search"
+        "fs_sandbox": "true",  # macOS sandbox-exec: restrict bash to workspace
     },
     "mcp": {
         "servers": [],
