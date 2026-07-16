@@ -41,7 +41,7 @@ def _action(name: str, description: str, parameters: dict, optional: list[str] =
 TOOL_CATEGORIES = {
     "files": {"read_file", "write_file", "edit_file", "list_directory", "grep"},
     "bash": {"bash", "bash_batch"},
-    "web": {"web_search", "web_fetch", "http_request", "http_batch", "socket_raw"},
+    "web": {"web_search", "web_fetch", "http_request", "http_batch", "socket_raw", "browser_navigate", "browser_snapshot", "browser_click", "browser_fill", "browser_screenshot", "browser_exec"},
     "diary": {"diary_add", "diary_list", "diary_search", "diary_get"},
     "skills": {"skill_create", "skill_add_tool", "skill_add_reference", "skill_add_asset", "skill_reference_list", "skill_reference_get", "custom_tool_add", "custom_tool_list"},
     "tasks": {"task", "task_poll", "task_list", "task_parallel", "plan"},
@@ -416,37 +416,96 @@ def _normalize_tool_def(tool: dict) -> dict | None:
     return {"type": "function", "function": {"name": name, "description": desc, "parameters": params}}
 
 def _merge_custom_tools(defs: list, handlers: dict, disabled: set):
+    """Load custom tools from ~/.ely/tools/ directory.
+    Each .py file can define:
+      - TOOLS list + handle_tool(name, params) function (explicit)
+      - tool_* functions with docstrings (auto-detected)
+    Files are loaded at startup and on /reload. Errors are logged to stderr.
+    """
     import importlib.util as _iu
+    import sys as _sys
     d = _custom_tools_dir()
     if not os.path.isdir(d): return
+
     for fname in sorted(os.listdir(d)):
         if not fname.endswith(".py"): continue
+        if fname.startswith("_"): continue  # skip private modules
         mp = os.path.join(d, fname)
+        mod_name = f"ely_custom_{fname[:-3]}"
+
+        # Reload if previously loaded (supports hot-reload)
+        if mod_name in _sys.modules:
+            del _sys.modules[mod_name]
+
         try:
-            spec = _iu.spec_from_file_location(f"ely_custom_{fname[:-3]}", mp)
+            spec = _iu.spec_from_file_location(mod_name, mp)
             if not spec or not spec.loader: continue
             mod = _iu.module_from_spec(spec)
             spec.loader.exec_module(mod)
+
+            # Explicit format: TOOLS list + handle_tool dispatcher
             tools = getattr(mod, "TOOLS", None)
             dispatcher = getattr(mod, "handle_tool", None)
+
+            # Auto-detect: tool_* functions
             if tools is None or not callable(dispatcher):
-                tools, dispatcher = _extract_tools_from_module(mod)
-            if not tools or not callable(dispatcher): continue
+                auto_tools, auto_dispatcher = _extract_tools_from_module(mod)
+                if auto_tools:
+                    if tools is None:
+                        tools = auto_tools
+                    else:
+                        tools.extend(auto_tools)
+                    if not callable(dispatcher):
+                        dispatcher = auto_dispatcher
+
+            if not tools or not callable(dispatcher):
+                if _is_verbose():
+                    print(f"[ely] Warning: {fname} has no TOOLS or handle_tool — skipped", file=_sys.stderr)
+                continue
+
+            count = 0
             for td in tools:
                 normalized = _normalize_tool_def(td)
                 if not normalized: continue
                 fi = normalized["function"]
                 on = fi.get("name", "")
+                if not on: continue
                 prefixed = f"custom__{on}"
+                if prefixed in disabled: continue
                 pdef = {"type": "function", "function": {**fi, "name": prefixed, "description": f"[Custom] {fi.get('description', '')}"}}
                 defs.append(pdef)
                 handlers[prefixed] = (lambda d, o: lambda **kw: str(d(o, kw)))(dispatcher, on)
-        except Exception: pass
+                count += 1
+
+            if _is_verbose():
+                print(f"[ely] Loaded {count} tool(s) from {fname}", file=_sys.stderr)
+
+        except Exception as e:
+            print(f"[ely] Error loading tool {fname}: {e}", file=_sys.stderr)
+
+
+def _is_verbose() -> bool:
+    """Check if verbose custom tool loading is enabled."""
+    from ..config import get_bool
+    return get_bool("tools", "verbose_custom", False)
+
+
+def reload_custom_tools():
+    """Force reload of all custom tools. Useful for hot-reload without restart."""
+    import sys as _sys
+    d = _custom_tools_dir()
+    if not os.path.isdir(d): return
+    for fname in sorted(os.listdir(d)):
+        if not fname.endswith(".py"): continue
+        mod_name = f"ely_custom_{fname[:-3]}"
+        if mod_name in _sys.modules:
+            del _sys.modules[mod_name]
+    # Next get_tools() call will reload
 
 
 # ── Import all tool modules to trigger @_action registration ──
 
-from . import bash, files, web, diary, skills, contexts, subagents, custom, sandbox
+from . import bash, files, web, diary, skills, contexts, subagents, custom, sandbox, browser
 
 # ── Utilities imported by agent.py ──
 

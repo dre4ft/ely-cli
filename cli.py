@@ -51,6 +51,7 @@ COMMANDS = {
     "/skill":      ("Gérer les compétences", ["list", "activate", "deactivate", "delete"]),
     "/mcp":        ("Gérer les serveurs MCP connectés", ["list", "reload"]),
     "/subagent":   ("Gérer les sous-agents en arrière-plan", ["list", "kill"]),
+    "/reload":     ("Recharger les outils customs et skills à chaud", None),
     "/help":       ("Afficher cette aide", None),
 }
 
@@ -530,10 +531,15 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
                 provider = create_provider(get_provider_config(slot))
                 console.print("[dim]🤔 Réflexion...[/]")
                 try:
-                    resp = provider.chat(
-                        messages=[{"role": "user", "content": query}],
-                        tools=None,
-                    )
+                    # Build messages with conversation history (no system prompt, no tools)
+                    msgs = []
+                    for h in history[-8:]:
+                        role = h.get("role", "user")
+                        content = h.get("content", "")
+                        if role in ("user", "assistant"):
+                            msgs.append({"role": role, "content": str(content)[:2500]})
+                    msgs.append({"role": "user", "content": query})
+                    resp = provider.chat(messages=msgs, tools=None)
                     console.print(Markdown(resp.get("content", "Pas de réponse.")))
                 except Exception as e:
                     console.print(f"[red]Erreur: {e}[/]")
@@ -565,6 +571,11 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
                 continue
             if cmd == "/tokens":
                 console.print(f"[dim]🪙 Total: {total_tokens['total']:,} tokens (prompt: {total_tokens['prompt']:,}, completion: {total_tokens['completion']:,})[/]")
+                continue
+            if cmd == "/reload":
+                from ely.tools import reload_custom_tools
+                reload_custom_tools()
+                console.print("[green]✓ Tools customs et skills rechargés.[/]")
                 continue
             if cmd.startswith("/diary"):
                 _handle_diary(user_input)

@@ -14,15 +14,30 @@ def tool_web_search(query: str) -> str:
                              headers={"User-Agent": "Ely-CLI/1.0"})
         resp.raise_for_status()
         results = []
-        for m in _re.finditer(r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
-                              resp.text, _re.DOTALL | _re.IGNORECASE):
+
+        # Try DDG HTML results first
+        for m in _re.finditer(
+            r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
+            resp.text, _re.DOTALL | _re.IGNORECASE
+        ):
             link = m.group(1)
             title = unescape(_re.sub(r'<.*?>', '', m.group(2)).strip())
             snippet = unescape(_re.sub(r'<.*?>', '', m.group(3)).strip())
-            if title and link: results.append(f"- [{title}]({link})\n  {snippet[:200]}")
+            if title and link and "duckduckgo.com" not in link:
+                results.append(f"- [{title}]({link})\n  {snippet[:200]}")
             if len(results) >= 5: break
-        return "\n".join(results) if results else f"No results for: {query}"
-    except Exception as e: return f"Search error: {e}"
+
+        # Fallback: extract any links from the page
+        if not results:
+            for m in _re.finditer(r'<a[^>]*href="(https?://[^"]+)"[^>]*>(.*?)</a>', resp.text, _re.DOTALL | _re.IGNORECASE):
+                link = m.group(1)
+                text = unescape(_re.sub(r'<.*?>', ' ', m.group(2)).strip())[:200]
+                if text and link and not any(d in link for d in ("duckduckgo.com", "facebook.com", "twitter.com", "apple.com")):
+                    results.append(f"- {text}\n  {link}")
+                if len(results) >= 5: break
+
+        return "\n".join(results) if results else f"No results for: {query}\nTry web_fetch with a search engine URL, or use browser_navigate to search directly."
+    except Exception as e: return f"Search error: {e}\nTry browser_navigate to search on Google, Bing, or DuckDuckGo directly."
 
 
 @_action("web_fetch", "Fetch and extract text content from a URL.",

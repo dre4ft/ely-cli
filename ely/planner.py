@@ -6,20 +6,18 @@ Each sub-agent gets only the task-specific context, minimizing token usage.
 import json
 import re
 
-PLANNER_PROMPT = """You are a task planner. Decompose the user's request into independent sub-tasks.
+PLANNER_PROMPT = """Decompose request into independent sub-tasks. Output ONLY JSON array.
 
 Rules:
-- Each sub-task must be SELF-CONTAINED (the sub-agent only sees its task, nothing else)
-- Include ALL relevant context in each task description (file paths, patterns, expected output)
-- Sub-tasks should be INDEPENDENT — they can run in parallel
-- Max 6 sub-tasks. If the request is simple, return just 1.
-- Each sub-task needs: id, description, context (default/code/sysadmin/research), tool_hint (optional)
+- Each task SELF-CONTAINED (sub-agent only sees its task)
+- Include ALL context in description (paths, patterns, expected output)
+- Tasks INDEPENDENT -> parallel
+- Max 6. Simple = 1.
+- Fields: id, desc, context, hint
 
-Output ONLY valid JSON array:
-[{"id": 1, "desc": "...", "context": "code", "hint": "bash|read_file|grep|web_search|..."}]
+Format: [{"id":1,"desc":"...","context":"code","hint":"bash|grep|..."}]
 
-User request: {request}
-
+Request: {request}
 JSON:"""
 
 
@@ -48,20 +46,14 @@ def parse_plan(response: str) -> list[dict]:
 
 
 def build_subagent_prompt(task: dict) -> str:
-    """Build minimal context for a sub-agent — only the task itself."""
+    """Build minimal context for a sub-agent."""
     desc = task.get("desc", task.get("description", ""))
     ctx = task.get("context", "default")
     hint = task.get("hint", "")
-
-    prompt = f"""**Task #{task.get('id', '?')}**: {desc}
-
-Context: {ctx}
-{f'Recommended tools: {hint}' if hint else ''}
-
-CRITICAL: You have only 3-4 turns. Be laser-focused. No exploration, just execution.
-Start with the result directly. At the end, suggest 1-2 evolution axes if relevant:
-🔄 Evolution: [concrete next step]
-"""
+    tid = task.get('id', '?')
+    prompt = f"Task #{tid}: {desc}\nContext: {ctx}"
+    if hint: prompt += f"\nTools: {hint}"
+    prompt += "\n3-4 turns max. No markdown. Result first. End with 🔄 Evolution if relevant."
     return prompt
 
 
