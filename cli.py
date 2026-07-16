@@ -525,8 +525,8 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
         if user_input.startswith("#"):
             cmd = user_input[1:].strip()
             if cmd:
-                from ely.tools import tool_bash
-                output = tool_bash(cmd)
+                from ely.tools import _run_direct
+                output = _run_direct(cmd, sanitize=False)
                 console.print(f"[dim]$ {cmd}[/]")
                 console.print(output)
             continue
@@ -620,6 +620,11 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
                         parts.append(Text.from_markup(f"[cyan]🔧 {rich_escape(_current_tool)}[/]", overflow="ellipsis"))
                     if _current_result:
                         parts.append(Text.from_markup(f"[dim]   ⮡ {rich_escape(_current_result)}[/]", overflow="ellipsis"))
+                    # Sub-agent statuses in magenta
+                    from ely.subagent import get_sub_statuses
+                    subs = get_sub_statuses()
+                    for sid, s in sorted(subs.items()):
+                        parts.append(Text.from_markup(f"[magenta]  ⚡ {rich_escape(s)}[/]", overflow="ellipsis"))
                     live.update(Text("\n").join(parts))
 
                 result = chat(

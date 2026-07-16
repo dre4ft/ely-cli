@@ -57,7 +57,7 @@ TOOL_CATEGORIES = {
     "web": {"web_search", "web_fetch", "http_request", "http_batch", "socket_raw"},
     "diary": {"diary_add", "diary_list", "diary_search", "diary_get"},
     "skills": {"skill_create", "skill_add_tool", "skill_add_reference", "skill_add_asset", "skill_reference_list", "skill_reference_get", "custom_tool_add", "custom_tool_list"},
-    "tasks": {"task", "task_poll", "task_list", "task_parallel"},
+    "tasks": {"task", "task_poll", "task_list", "task_parallel", "plan"},
     "contexts": {"context_list", "context_create", "context_get"},
 }
 
@@ -326,6 +326,7 @@ def cleanup_sandbox():
 
 def _run_in_sandbox(command: str, timeout: int = 30) -> str:
     """Execute a command inside a Docker sandbox container."""
+    cmd = _sanitize_command(command, sandbox=True)
     container_name = SANDBOX_CONTAINER
     ws = _workspace_dir()
     check = subprocess.run(
@@ -344,7 +345,7 @@ def _run_in_sandbox(command: str, timeout: int = 30) -> str:
             return f"Error creating sandbox: {create.stderr}"
 
     result = subprocess.run(
-        ["docker", "exec", "-i", container_name, "sh", "-c", command],
+        ["docker", "exec", "-i", container_name, "sh", "-c", cmd],
         capture_output=True, text=True, timeout=timeout,
     )
     out = result.stdout
@@ -353,10 +354,54 @@ def _run_in_sandbox(command: str, timeout: int = 30) -> str:
     return out[:3000] or f"(exit code {result.returncode})"
 
 
-def _run_direct(command: str, timeout: int = 30) -> str:
-    """Execute a command directly on the host machine."""
+def _sanitize_command(command: str, sandbox: bool = False, block_dotdot: bool = False) -> str:
+    """Tokenize workspace path and prevent directory escape.
+
+    - Replaces workspace path with '.' (direct) or '/workspace' (sandbox)
+    - When block_dotdot=True: collapses '..' sequences to prevent parent traversal.
+      'a/b/../c' → 'a/c' but '../..' → stripped.
+    """
+    ws = _workspace_dir()
+    replacement = "/workspace" if sandbox else "."
+    cmd = command.replace(ws, replacement)
+    cmd = cmd.replace(ws.rstrip("/") + "/", replacement.rstrip("/") + "/")
+
+    if block_dotdot and ".." in cmd:
+        import shlex as _shlex
+        import os as _os
+        import re as _re
+        try:
+            parts = _shlex.split(cmd)
+        except ValueError:
+            parts = cmd.split()
+        resolved_parts = []
+        for p in parts:
+            if '..' in p:
+                if p == '..':
+                    resolved_parts.append('.')
+                else:
+                    norm = _os.path.normpath(p)
+                    norm = _re.sub(r'^(\.\./)+', '', norm)
+                    norm = _re.sub(r'/\.\.$', '', norm)
+                    norm = _re.sub(r'^\.\.$', '.', norm)
+                    if not norm:
+                        norm = '.'
+                    if norm.startswith('/'):
+                        norm = '.' + norm
+                    resolved_parts.append(norm)
+            else:
+                resolved_parts.append(p)
+        cmd = ' '.join(resolved_parts)
+
+    return cmd
+
+
+def _run_direct(command: str, timeout: int = 30, sanitize: bool = True) -> str:
+    """Execute a command directly on the host machine.
+    When sanitize=True (agent calls): workspace path tokenized, .. blocked."""
+    cmd = _sanitize_command(command, block_dotdot=sanitize) if sanitize else command
     result = subprocess.run(
-        command, shell=True, capture_output=True, text=True, timeout=timeout,
+        cmd, shell=True, capture_output=True, text=True, timeout=timeout,
         cwd=_workspace_dir(),
     )
     out = result.stdout
@@ -799,13 +844,18 @@ def tool_task(description: str, context: str = "default") -> str:
     """Spawn a background sub-agent. Non-blocking."""
     global _task_id_counter
     try:
-        from .subagent import SubAgent
+        from .subagent import SubAgent, _update_sub_status, _remove_sub_status
 
         with _task_lock:
             _task_id_counter += 1
             tid = _task_id_counter
 
-        agent = SubAgent(description, context=context)
+        def _sub_cb(event, data):
+            _update_sub_status(tid, data)
+            if event == "sub_done":
+                _remove_sub_status(tid)
+
+        agent = SubAgent(description, context=context, status_cb=_sub_cb)
         agent.start()
 
         with _task_lock:
@@ -883,12 +933,22 @@ def tool_task_parallel(tasks: str) -> str:
         desc = t.get("task", t.get("description", "Unknown"))
         ctx = t.get("context", "default")
         try:
-            from .subagent import SubAgent
-            agent = SubAgent(desc, context=ctx)
-            agent.start()
+            from .subagent import SubAgent, _update_sub_status, _remove_sub_status
             with _task_lock:
                 _task_id_counter += 1
                 tid = _task_id_counter
+
+            def _make_cb(tid):
+                def _cb(event, data):
+                    _update_sub_status(tid, data)
+                    if event == "sub_done":
+                        _remove_sub_status(tid)
+                return _cb
+
+            agent = SubAgent(desc, context=ctx, status_cb=_make_cb(tid))
+            agent.start()
+            _update_sub_status(tid, f"[sub] {desc[:60]}...")
+            with _task_lock:
                 _background_tasks[tid] = {"agent": agent, "desc": desc, "started": _time_module.time()}
             ids.append(str(tid))
         except Exception as e:
@@ -897,9 +957,83 @@ def tool_task_parallel(tasks: str) -> str:
     return f"{len(ids)} tasks started in background: IDs {', '.join(ids)}\nUse task_poll(<id>) to check each, task_list to see all."
 
 
-# ═══════════════════════════════════════════════════════════════
-# Custom global tools — user-defined tools always available
-# ═══════════════════════════════════════════════════════════════
+@_action("plan", "Decompose a complex task into sub-tasks, dispatch them to parallel sub-agents with minimal context, and return aggregated results. Use for complex multi-step analysis. Each sub-agent only sees its task, saving tokens.",
+         {"request": {"type": "string", "description": "The full task to decompose and execute. Include all relevant details (file paths, patterns, expected output)."}})
+def tool_plan(request: str) -> str:
+    """Plan + execute complex tasks via parallel sub-agents."""
+    from .planner import estimate_complexity, PLANNER_PROMPT, parse_plan, build_subagent_prompt
+    from .subagent import SubAgentPool
+
+    # Quick heuristic: skip planning for simple requests
+    complexity = estimate_complexity(request)
+    if complexity <= 1:
+        # Simple task — run directly as one sub-agent
+        from .subagent import SubAgent
+        agent = SubAgent(request, context="default", max_turns=4)
+        agent.start()
+        result = agent.wait(timeout=120)
+        if result and result.get("reply"):
+            return f"**Direct execution (simple task):**\n\n{result['reply']}"
+        return "Failed to execute task."
+
+    # Complex task — get a plan from the LLM
+    try:
+        from .providers import create_provider
+        from .config import get_provider_config
+        cfg = get_provider_config("provider")
+        provider = create_provider(cfg)
+
+        plan_resp = provider.chat(
+            messages=[{"role": "user", "content": PLANNER_PROMPT.format(request=request)}],
+            tools=None,
+        )
+        plan_text = plan_resp.get("content", "")
+        tasks = parse_plan(plan_text)
+
+        if not tasks or len(tasks) < 2:
+            # Plan failed or unnecessary — run directly
+            from .subagent import SubAgent
+            agent = SubAgent(request, context="default", max_turns=5)
+            agent.start()
+            result = agent.wait(timeout=120)
+            return f"**Direct execution:**\n\n{result.get('reply', 'No result')}" if result else "Failed."
+
+        # Dispatch sub-tasks to parallel sub-agents
+        pool = SubAgentPool(max_workers=min(len(tasks), 6))
+        for task in tasks:
+            prompt = build_subagent_prompt(task)
+            pool.submit(
+                prompt,
+                context=task.get("context", "default"),
+                max_turns=task.get("max_turns", 4),
+            )
+
+        results = pool.wait_all(timeout=120)
+
+        # Aggregate results
+        total_tokens = 0
+        lines = [f"**Plan executed: {len(tasks)} sub-tasks across {min(len(tasks), 6)} parallel agents**\n"]
+        for i, (task, r) in enumerate(zip(tasks, results)):
+            reply = r.get("reply", "No result") if r else "Timeout"
+            actions = r.get("actions", []) if r else []
+            tokens = r.get("tokens", {}).get("total", 0) if r else 0
+            total_tokens += tokens
+            lines.append(f"### Sub-task {i+1}: {task.get('desc', task.get('description', 'Unknown'))[:100]}")
+            lines.append(reply[:600])
+            if actions:
+                lines.append(f"  [{' '.join(actions)}]")
+            lines.append("")
+
+        lines.append(f"---\nTotal tokens: {total_tokens:,} across {len(tasks)} sub-agents")
+        return "\n".join(lines)
+
+    except Exception as e:
+        # Fallback: run directly
+        from .subagent import SubAgent
+        agent = SubAgent(request, context="default", max_turns=5)
+        agent.start()
+        result = agent.wait(timeout=120)
+        return f"**Fallback (plan failed: {e}):**\n\n{result.get('reply', 'No result')}" if result else f"Error: {e}"
 
 @_action("custom_tool_add", "Create a global custom tool available in all sessions. Same format as skill tools: TOOLS list + handle_tool(name, params) function.",
          {"tool_filename": {"type": "string", "description": "Python filename (e.g. 'my_utils.py'). Must end with .py"},
