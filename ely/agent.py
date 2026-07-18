@@ -6,7 +6,7 @@ Extracted and adapted from ely/agent.py.
 import json
 from .providers import create_provider
 from .config import get_provider_config, get_int, get, get_bool
-from .tools import get_tools, get_workspace_info, get_diary_context, _get_dynamic_tool_names
+from .tools import get_tools, get_workspace_info, get_diary_context, _dynamic_names
 from .guard import sanitize
 from .skills import build_skills_prompt
 from .prompts import BASE_PROMPT, SLASH_PROMPTS
@@ -37,8 +37,8 @@ def _build_system_prompt(context: str = "default") -> str:
     prompt += "\nTous les chemins de fichiers sont relatifs au workspace. Tu ne peux pas lire/écrire en dehors."
 
     # Bash mode (informational — agent cannot change it)
-    from .tools import _is_sandbox_enabled
-    if _is_sandbox_enabled():
+    from .tools._core import is_sandbox
+    if is_sandbox():
         prompt += "\n**Bash :** sandbox Docker (réseau isolé, workspace monté dans /workspace)."
     else:
         prompt += "\n**Bash :** exécution directe sur la machine hôte. Sois prudent avec les commandes destructives."
@@ -72,6 +72,47 @@ def _check_slash_command(message: str) -> str | None:
             rest = msg[len(cmd) + 1:].strip()
             return f"{prefix}\n\n{rest}" if rest else prefix
     return None
+
+
+def _estimate_tokens(messages: list, tool_defs: list = None) -> int:
+    """Rough token estimation: ~3 chars per token for English, ~4 for French."""
+    total = sum(len(str(m.get("content", ""))) for m in messages)
+    if tool_defs:
+        total += sum(len(str(t)) for t in tool_defs)
+    return total // 3
+
+
+def _cap_context_window(messages: list, tool_defs: list, max_tokens: int = 28000):
+    """Trim older messages if estimated tokens exceed budget.
+    Always keeps system message + last user message. Trims from the middle."""
+    estimated = _estimate_tokens(messages, tool_defs)
+    if estimated <= max_tokens:
+        return
+
+    # Keep system (idx 0) and last user message (idx -1)
+    system = messages[0]
+    last_user = messages[-1] if messages[-1]["role"] == "user" else None
+
+    # Trim content of middle messages progressively
+    trim_size = 4000
+    while estimated > max_tokens and trim_size >= 500:
+        for m in messages[1:-1]:
+            content = str(m.get("content", ""))
+            if len(content) > trim_size:
+                m["content"] = content[:trim_size]
+        estimated = _estimate_tokens(messages, tool_defs)
+        trim_size -= 500
+
+    # If still over budget, remove oldest non-system messages
+    while estimated > max_tokens and len(messages) > 3:
+        # Remove oldest non-system, non-last-user message
+        for i in range(1, len(messages) - 1):
+            if messages[i]["role"] != "system" and messages[i] != last_user:
+                messages.pop(i)
+                break
+        else:
+            break
+        estimated = _estimate_tokens(messages, tool_defs)
 
 
 def chat(
@@ -125,7 +166,7 @@ def chat(
         pass
 
     # Get tools — dynamically filter based on message, broaden on later turns
-    dynamic_names = _get_dynamic_tool_names(clean_msg, history)
+    dynamic_names = _dynamic_names(clean_msg, history)
     if dynamic_names:
         tool_defs, tool_handlers = get_tools(names=dynamic_names)
     else:
@@ -159,6 +200,10 @@ def chat(
         if turn == 1 and dynamic_names:
             tool_defs, tool_handlers = get_tools()
             dynamic_names = None
+
+        # Token budget: 30K max for flash models, unlimited for pro
+        if slot != "pro_provider":
+            _cap_context_window(messages, tool_defs, max_tokens=28000)
         if status_cb:
             status_cb("thinking", f"Réflexion... (tour {turn + 1}/{max_turns})")
         try:

@@ -1,8 +1,6 @@
 """Filesystem sandbox — OS-level write restriction (macOS sandbox-exec / Linux bwrap)."""
-import os
-import subprocess
-import tempfile
-from . import _workspace_dir
+import os, subprocess, tempfile
+from ._core import workspace_dir
 
 
 def _fs_sandbox_enabled() -> bool:

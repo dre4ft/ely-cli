@@ -573,8 +573,8 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
                 console.print(f"[dim]🪙 Total: {total_tokens['total']:,} tokens (prompt: {total_tokens['prompt']:,}, completion: {total_tokens['completion']:,})[/]")
                 continue
             if cmd == "/reload":
-                from ely.tools import reload_custom_tools
-                reload_custom_tools()
+                from ely.tools import reload_custom
+                reload_custom()
                 console.print("[green]✓ Tools customs et skills rechargés.[/]")
                 continue
             if cmd.startswith("/diary"):

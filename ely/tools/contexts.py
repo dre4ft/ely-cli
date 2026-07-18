@@ -1,8 +1,8 @@
 """Context tools — manage agent contexts."""
-from . import _action
+from ._core import action
 
 
-@_action("context_list", "List all available contexts.", {})
+@action("context_list", "List all available contexts.", {})
 def tool_context_list() -> str:
     from ..contexts import list_contexts
     ctxs = list_contexts()
@@ -12,7 +12,7 @@ def tool_context_list() -> str:
     return "\n".join(lines)
 
 
-@_action("context_create", "Create a new custom context.",
+@action("context_create", "Create a new custom context.",
          {"name": {"type": "string", "description": "Context name (slug)."},
           "description": {"type": "string", "description": "One-line description."},
           "prompt": {"type": "string", "description": "Instructions for the agent."}})
@@ -22,7 +22,7 @@ def tool_context_create(name: str, description: str, prompt: str) -> str:
     return f"Context '{name}' created at {path}. Activate with /context activate {name}."
 
 
-@_action("context_get", "Get the full content of a context.",
+@action("context_get", "Get the full content of a context.",
          {"name": {"type": "string", "description": "Context name."}})
 def tool_context_get(name: str) -> str:
     from ..contexts import get_context

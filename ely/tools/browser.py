@@ -1,7 +1,7 @@
 """Playwright browser tools — real browser automation for the agent."""
 
 import threading
-from . import _action
+from ._core import action
 
 _browser = None
 _browser_lock = threading.Lock()
@@ -16,7 +16,7 @@ def _get_browser():
     return _browser
 
 
-@_action("browser_navigate", "Navigate to a URL and return the page text content.",
+@action("browser_navigate", "Navigate to a URL and return the page text content.",
          {"url": {"type": "string", "description": "URL to navigate to."},
           "wait_until": {"type": "string", "description": "Wait until: load, domcontentloaded, networkidle (default: domcontentloaded)."}},
          optional=["wait_until"])
@@ -36,7 +36,7 @@ def tool_browser_navigate(url: str, wait_until: str = "domcontentloaded") -> str
         return f"Browser navigate error: {e}"
 
 
-@_action("browser_snapshot", "Get an accessibility snapshot of the current page. Shows interactive elements with refs for clicking/filling.",
+@action("browser_snapshot", "Get an accessibility snapshot of the current page. Shows interactive elements with refs for clicking/filling.",
          {"url": {"type": "string", "description": "URL to snapshot (reuses existing page if same URL)."}})
 def tool_browser_snapshot(url: str) -> str:
     try:
@@ -91,7 +91,7 @@ def tool_browser_snapshot(url: str) -> str:
         return f"Browser snapshot error: {e}"
 
 
-@_action("browser_click", "Click an element on the page by its snapshot ref number.",
+@action("browser_click", "Click an element on the page by its snapshot ref number.",
          {"url": {"type": "string", "description": "Current page URL."},
           "ref": {"type": "integer", "description": "Element ref number from browser_snapshot."}})
 def tool_browser_click(url: str, ref: int) -> str:
@@ -121,7 +121,7 @@ def tool_browser_click(url: str, ref: int) -> str:
         return f"Browser click error: {e}"
 
 
-@_action("browser_fill", "Fill a form field identified by its snapshot ref.",
+@action("browser_fill", "Fill a form field identified by its snapshot ref.",
          {"url": {"type": "string", "description": "Current page URL."},
           "ref": {"type": "integer", "description": "Element ref number from browser_snapshot."},
           "value": {"type": "string", "description": "Text to fill into the field."}})
@@ -149,7 +149,7 @@ def tool_browser_fill(url: str, ref: int, value: str) -> str:
         return f"Browser fill error: {e}"
 
 
-@_action("browser_screenshot", "Take a screenshot of a page. Use to see visual layout, CAPTCHAs, or rendered content.",
+@action("browser_screenshot", "Take a screenshot of a page. Use to see visual layout, CAPTCHAs, or rendered content.",
          {"url": {"type": "string", "description": "URL to screenshot."},
           "full_page": {"type": "boolean", "description": "Capture full scrollable page? Default false."}},
          optional=["full_page"])
@@ -169,7 +169,7 @@ def tool_browser_screenshot(url: str, full_page: bool = False) -> str:
         return f"Browser screenshot error: {e}"
 
 
-@_action("browser_exec", "Execute JavaScript in the browser page and return the result.",
+@action("browser_exec", "Execute JavaScript in the browser page and return the result.",
          {"url": {"type": "string", "description": "Current page URL."},
           "script": {"type": "string", "description": "JavaScript code to execute. Use return to get values back."}})
 def tool_browser_exec(url: str, script: str) -> str:

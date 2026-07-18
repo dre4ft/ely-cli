@@ -2,7 +2,7 @@
 import json
 import threading
 import time as _time_module
-from . import _action
+from ._core import action
 
 _background_tasks: dict[int, dict] = {}
 _task_id_counter = 0
@@ -21,7 +21,7 @@ def _get_background_results() -> str:
     return "\n\n".join(completed) if completed else ""
 
 
-@_action("task", "Spawn a sub-agent in BACKGROUND. Returns immediately with a task ID.",
+@action("task", "Spawn a sub-agent in BACKGROUND. Returns immediately with a task ID.",
          {"description": {"type": "string", "description": "Task description."},
           "context": {"type": "string", "description": "Context: default, code, sysadmin, research"}},
          optional=["context"])
@@ -40,7 +40,7 @@ def tool_task(description: str, context: str = "default") -> str:
     except Exception as e: return f"Sub-agent error: {e}"
 
 
-@_action("task_poll", "Check the status of a background task.",
+@action("task_poll", "Check the status of a background task.",
          {"task_id": {"type": "integer", "description": "Task ID returned by task()"}})
 def tool_task_poll(task_id: int) -> str:
     with _task_lock: t = _background_tasks.get(task_id)
@@ -58,7 +58,7 @@ def tool_task_poll(task_id: int) -> str:
     return out
 
 
-@_action("task_list", "List all background tasks and their status.", {})
+@action("task_list", "List all background tasks and their status.", {})
 def tool_task_list() -> str:
     with _task_lock:
         if not _background_tasks: return "No background tasks running."
@@ -71,7 +71,7 @@ def tool_task_list() -> str:
         return "\n".join(lines)
 
 
-@_action("task_parallel", "Spawn MULTIPLE sub-agents in background. Returns immediately with task IDs.",
+@action("task_parallel", "Spawn MULTIPLE sub-agents in background. Returns immediately with task IDs.",
          {"tasks": {"type": "string", "description": "JSON array: [{\"task\": \"desc\", \"context\": \"default\"}]"}})
 def tool_task_parallel(tasks: str) -> str:
     global _task_id_counter
@@ -96,7 +96,7 @@ def tool_task_parallel(tasks: str) -> str:
     return f"{len(ids)} tasks started: IDs {', '.join(ids)}\nUse task_poll(<id>) to check, task_list to see all."
 
 
-@_action("plan", "Decompose a complex task into sub-tasks, dispatch to parallel sub-agents with minimal context.",
+@action("plan", "Decompose a complex task into sub-tasks, dispatch to parallel sub-agents with minimal context.",
          {"request": {"type": "string", "description": "The full task to decompose and execute."}})
 def tool_plan(request: str) -> str:
     from ..planner import estimate_complexity, PLANNER_PROMPT, parse_plan, build_subagent_prompt

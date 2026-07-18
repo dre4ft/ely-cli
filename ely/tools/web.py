@@ -1,10 +1,10 @@
 """Web tools — search, fetch, HTTP requests, raw sockets."""
 import json
 import requests
-from . import _action
+from ._core import action
 
 
-@_action("web_search", "Search the web for information.",
+@action("web_search", "Search the web for information.",
          {"query": {"type": "string", "description": "Search query."}})
 def tool_web_search(query: str) -> str:
     try:
@@ -40,7 +40,7 @@ def tool_web_search(query: str) -> str:
     except Exception as e: return f"Search error: {e}\nTry browser_navigate to search on Google, Bing, or DuckDuckGo directly."
 
 
-@_action("web_fetch", "Fetch and extract text content from a URL.",
+@action("web_fetch", "Fetch and extract text content from a URL.",
          {"url": {"type": "string", "description": "URL to fetch."}})
 def tool_web_fetch(url: str) -> str:
     try:
@@ -63,7 +63,7 @@ def tool_web_fetch(url: str) -> str:
     except Exception as e: return f"Error fetching {url}: {e}"
 
 
-@_action("http_request", "Make an HTTP request with full control over method, headers, and body.",
+@action("http_request", "Make an HTTP request with full control over method, headers, and body.",
          {"url": {"type": "string", "description": "Target URL."},
           "method": {"type": "string", "description": "HTTP method: GET, POST, PUT, DELETE, PATCH, OPTIONS, HEAD."},
           "headers": {"type": "string", "description": "JSON object of headers."},
@@ -88,26 +88,26 @@ def tool_http_request(url: str, method: str = "GET", headers: str = "{}", body: 
     except Exception as e: return f"HTTP request error: {e}"
 
 
-@_action("http_batch", "Execute multiple HTTP requests in PARALLEL.",
+@action("http_batch", "Execute multiple HTTP requests in PARALLEL.",
          {"requests": {"type": "string", "description": "JSON array: [{\"url\": \"...\", \"method\": \"GET\", \"headers\": {}, \"body\": \"\"}]."}})
 def tool_http_batch(requests: str) -> str:
     try:
         reqs = json.loads(requests)
         if not isinstance(reqs, list): return "Error: requests must be a JSON array"
     except json.JSONDecodeError: return "Error: invalid JSON"
-    from . import _run_parallel
+    from ._core import run_parallel
     def _one(req):
         if not isinstance(req, dict): return "Error: invalid request"
         hdrs = req.get("headers", {})
         return tool_http_request(url=req.get("url", ""), method=req.get("method", "GET"),
                                  headers=json.dumps(hdrs) if isinstance(hdrs, dict) else str(hdrs),
                                  body=str(req.get("body", "")))
-    results = _run_parallel(reqs, _one)
+    results = run_parallel(reqs, _one)
     return "\n\n".join(f"--- [{i}] {req.get('method', 'GET')} {req.get('url', '?')} ---\n{output}"
                        for i, (req, output) in enumerate(zip(reqs, results)))
 
 
-@_action("socket_raw", "Open a raw TCP socket to a host:port, send data, and read the response.",
+@action("socket_raw", "Open a raw TCP socket to a host:port, send data, and read the response.",
          {"host": {"type": "string", "description": "Target hostname or IP."},
           "port": {"type": "integer", "description": "Target port."},
           "data": {"type": "string", "description": "Data to send. Use \\r\\n for line breaks."},
