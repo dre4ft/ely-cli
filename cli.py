@@ -27,8 +27,9 @@ from rich.rule import Rule
 from rich.text import Text
 from rich.table import Table
 
-from ely.agent import chat
-from ely.config import get, get_provider_config, get_bool
+from ely.agent import chat, _build_system_prompt
+from ely.config import get, get_provider_config, get_bool, get_int
+from ely.memory import build_memory_prompt
 
 console = Console()
 
@@ -456,7 +457,7 @@ def single_shot(query: str, context: str = "default", slot: str = "provider"):
         )
 
 
-def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
+def repl(context: str = "", slot: str = "provider", classic_ui: bool = False, stream_ui: bool = False):
     """Simple REPL mode without full TUI."""
     history = _load_history()
     total_tokens = {"prompt": 0, "completion": 0, "total": 0}
@@ -499,11 +500,16 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
         parts.append("[dim]🪙 {:,}[/]".format(total_tokens['total']))
         return " · ".join(parts)
 
-    console.print("[dim]?question = LLM sans tools | #commande = bash | /help | Tab | exit[/]")
+    if stream_ui:
+        from ely.tui_v2 import show_header, show_help
+        show_header(cfg["model"], context, ws, skill_status)
+    else:
+        console.print("[dim]?question = LLM sans tools | #commande = bash | /help | Tab | exit[/]")
 
     while True:
         try:
-            console.print(f"[dim]{_status_footer()}[/]")
+            if not stream_ui:
+                console.print(f"[dim]{_status_footer()}[/]")
             user_input = console.input("[bold green]›[/] ").strip()
             if user_input:
                 _save_readline_history()
@@ -613,6 +619,41 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False):
 
         history.append({"role": "user", "content": user_input})
 
+        # ── Streaming UI (Claude Code-like) ──
+        if stream_ui:
+            from ely.tui_v2 import (Conversation, stream_agent_reply, render_reply,
+                                     show_footer, show_header)
+
+            system_prompt = _build_system_prompt(context)
+            mem = build_memory_prompt("default")
+            if mem: system_prompt += mem
+
+            from ely.providers import create_provider
+            provider = create_provider(get_provider_config(slot))
+            tool_defs, tool_handlers = get_tools()
+
+            msgs = [{"role": "system", "content": system_prompt}]
+            for h in history[-10:]:
+                if h.get("role") in ("user", "assistant"):
+                    msgs.append({"role": h["role"], "content": str(h.get("content", ""))[:2500]})
+            msgs.append({"role": "user", "content": user_input})
+
+            conv = Conversation()
+            result = stream_agent_reply(provider, msgs, tool_defs, tool_handlers,
+                                        get_int("agent", "max_turns", 8), conv)
+            reply = result.get("reply", "")
+            actions = result.get("actions", [])
+            t = result.get("tokens", {})
+            total_tokens["prompt"] += t.get("prompt", 0)
+            total_tokens["completion"] += t.get("completion", 0)
+            total_tokens["total"] += t.get("total", 0)
+            history.append({"role": "assistant", "content": reply})
+            _save_history(history)
+            render_reply(conv, result)
+            show_footer(result.get("model", cfg["model"]), context,
+                        skill=build_skills_status_line(), tokens=total_tokens["total"])
+            continue
+
         # ── Call agent with live status display ──
         import time as _t
         _start = _t.time()
@@ -706,6 +747,7 @@ def main():
     parser.add_argument("--tui", action="store_true", default=False, help="TUI cockpit mode")
     parser.add_argument("--no-tui", action="store_true", help="Simple REPL mode (default)")
     parser.add_argument("--classic", action="store_true", default=False, help="Classic UI (original rendering)")
+    parser.add_argument("--stream", action="store_true", default=False, help="Streaming UI with permissions (Claude Code-like)")
     parser.add_argument("--context", default="default", help="Context (default, code, sysadmin, research)")
     parser.add_argument("--pro", action="store_true", help="Use pro provider")
     parser.add_argument("--model", default="", help="Override model")
@@ -738,7 +780,7 @@ def main():
     elif query:
         single_shot(query, context, slot)
     else:
-        repl(context, slot, classic_ui=args.classic)
+        repl(context, slot, classic_ui=args.classic, stream_ui=args.stream)
 
 
 if __name__ == "__main__":

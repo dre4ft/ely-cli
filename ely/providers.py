@@ -60,6 +60,49 @@ class OpenAIProvider:
             },
         }
 
+    def chat_stream(self, messages: list, tools: list = None):
+        """Streaming chat — yields (event, data) tuples.
+        Events: content, reasoning, tool_call, done, error"""
+        kwargs = {"model": self.model, "messages": messages, "stream": True}
+        if tools: kwargs["tools"] = tools
+
+        try:
+            stream = self.client.chat.completions.create(**kwargs)
+            content = ""; reasoning = ""; tool_calls = {}; usage = {}
+            for chunk in stream:
+                delta = chunk.choices[0].delta if chunk.choices else None
+                if delta:
+                    if delta.content:
+                        content += delta.content
+                        yield ("content", delta.content)
+                    if getattr(delta, "reasoning_content", ""):
+                        r = delta.reasoning_content
+                        reasoning += r
+                        yield ("reasoning", r)
+                    if delta.tool_calls:
+                        for tc in delta.tool_calls:
+                            idx = tc.index
+                            if idx not in tool_calls:
+                                tool_calls[idx] = {"id": tc.id or "", "type": "function",
+                                    "function": {"name": "", "arguments": ""}}
+                            if tc.id: tool_calls[idx]["id"] = tc.id
+                            if tc.function:
+                                if tc.function.name:
+                                    tool_calls[idx]["function"]["name"] += tc.function.name
+                                if tc.function.arguments:
+                                    tool_calls[idx]["function"]["arguments"] += tc.function.arguments
+                if chunk.usage:
+                    usage = {"prompt_tokens": chunk.usage.prompt_tokens or 0,
+                             "completion_tokens": chunk.usage.completion_tokens or 0,
+                             "total_tokens": chunk.usage.total_tokens or 0}
+            # Emit final tool calls
+            tcs = [tool_calls[i] for i in sorted(tool_calls)] if tool_calls else []
+            if tcs:
+                yield ("tool_calls", tcs)
+            yield ("done", {"content": content, "reasoning": reasoning, "tool_calls": tcs or None, "usage": usage})
+        except Exception as e:
+            yield ("error", str(e))
+
     def get_models(self) -> list:
         try:
             return [m.id for m in self.client.models.list()]
