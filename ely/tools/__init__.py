@@ -9,7 +9,7 @@ CATEGORIES = {
     "files": {"read_file", "write_file", "edit_file", "list_directory", "grep"},
     "bash":  {"bash", "bash_batch"},
     "web":   {"web_search", "web_fetch", "http_request", "http_batch", "socket_raw",
-              "browser_navigate", "browser_snapshot", "browser_click", "browser_fill", "browser_screenshot", "browser_exec"},
+              "browser_navigate", "browser_snapshot", "browser_click", "browser_fill", "browser_screenshot", "browser_exec", "vision"},
     "diary": {"diary_add", "diary_list", "diary_search", "diary_get"},
     "skills":{"skill_create", "skill_add_tool", "skill_add_reference", "skill_add_asset", "skill_reference_list", "skill_reference_get", "custom_tool_add", "custom_tool_list"},
     "tasks": {"task", "task_poll", "task_list", "task_parallel", "plan"},
@@ -17,7 +17,7 @@ CATEGORIES = {
 }
 
 KEYWORDS = {
-    "web":   ["http", "api", "url", "curl", "web", "site", "page", "recherche", "search", "fetch", "browser", "cve", "vuln", "ssti", "xss", "csrf", "jwt", "injection", "flag", "ctf", "endpoint"],
+    "web":   ["http", "api", "url", "curl", "web", "site", "page", "recherche", "search", "fetch", "browser", "cve", "vuln", "ssti", "xss", "csrf", "jwt", "injection", "flag", "ctf", "endpoint", "image", "photo", "screenshot", "picture", "img", "png", "jpg"],
     "diary": ["souvenir", "retenir", "diary", "note", "sauvegarde", "flag", "important"],
     "skills":["skill", "competence", "creer", "outil", "nouveau"],
     "tasks": ["parallele", "plusieurs fichiers", "sous-agent", "subagent", "background", "simultane", "chaque fichier"],
@@ -188,6 +188,8 @@ def get_diary_context(limit: int = 5) -> str:
 import os as _os
 from . import bash, files, web, diary, skills, contexts, subagents, custom, sandbox
 try: from . import browser
+except ImportError: pass
+try: from . import vision
 except ImportError: pass
 
 # Re-export commonly used symbols
