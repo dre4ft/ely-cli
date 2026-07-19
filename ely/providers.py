@@ -32,6 +32,9 @@ class OpenAIProvider:
         except Exception as e:
             return {"content": f"Error: {e}", "tool_calls": None, "usage": {}}
 
+        if resp is None:
+            return {"content": "Error: empty response from API", "tool_calls": None, "usage": {}}
+
         choice = resp.choices[0]
         msg = choice.message
 
@@ -68,6 +71,15 @@ class OpenAIProvider:
 
         try:
             stream = self.client.chat.completions.create(**kwargs)
+        except Exception as e:
+            yield ("error", str(e))
+            return
+
+        if stream is None:
+            yield ("error", "Empty response from API")
+            return
+
+        try:
             content = ""; reasoning = ""; tool_calls = {}; usage = {}
             for chunk in stream:
                 delta = chunk.choices[0].delta if chunk.choices else None

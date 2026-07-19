@@ -30,6 +30,7 @@ from rich.table import Table
 from ely.agent import chat, _build_system_prompt
 from ely.config import get, get_provider_config, get_bool, get_int
 from ely.memory import build_memory_prompt
+from ely.tools import get_tools
 
 console = Console()
 
@@ -572,8 +573,20 @@ def repl(context: str = "", slot: str = "provider", classic_ui: bool = False, st
             if cmd == "/clear":
                 history = []
                 total_tokens = {"prompt": 0, "completion": 0, "total": 0}
+                _save_history(history)
                 console.clear()
-                console.print("[dim]✨ Conversation purgée — historique et tokens remis à zéro.[/]\n")
+                parts = ["[dim]✨ Conversation purgée.[/]"]
+                parts.append("[dim]   Chat history + tokens: vidés[/]")
+                # Check if diary/memory exist
+                from ely.tools import _load_diary
+                diary_count = len(_load_diary())
+                from ely.memory import get_situation
+                mem = get_situation("default")
+                if diary_count > 0:
+                    parts.append(f"[dim]   Diary: {diary_count} entrées persistées (non affectées)[/]")
+                if mem:
+                    parts.append("[dim]   Mémoire: conservée (non affectée)[/]")
+                console.print("\n".join(parts) + "\n")
                 continue
             if cmd == "/tokens":
                 console.print(f"[dim]🪙 Total: {total_tokens['total']:,} tokens (prompt: {total_tokens['prompt']:,}, completion: {total_tokens['completion']:,})[/]")

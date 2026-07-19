@@ -41,6 +41,7 @@ tools:
   #   disabled: "write_file"                   → agent read-only
   #   disabled: "task, task_parallel"          → pas de sous-agents
   disabled: ""
+  fs_sandbox: false   
 
 # MCP (Model Context Protocol) servers — optional
 # Tools from these servers are auto-discovered and merged into the agent's toolset.
