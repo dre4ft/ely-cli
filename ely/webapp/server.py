@@ -15,9 +15,24 @@ current_context = "default"
 current_slot = "provider"
 
 
+def _get_index_html() -> str:
+    """Find index.html relative to this file or in common locations."""
+    candidates = [
+        Path(__file__).parent / "index.html",
+        Path(__file__).parent / "static" / "index.html",
+        Path.cwd() / "webapp" / "index.html",
+        Path.cwd() / "ely" / "webapp" / "index.html",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p.read_text()
+    # Fallback: embedded minimal HTML
+    return _FALLBACK_HTML
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    return (Path(__file__).parent / "index.html").read_text()
+    return _get_index_html()
 
 
 @app.post("/chat")
@@ -212,6 +227,59 @@ async def _sse_error(msg: str):
 def run():
     import uvicorn
     uvicorn.run(app, host="127.0.0.1", port=10080, log_level="info")
+
+
+_FALLBACK_HTML = """<!DOCTYPE html>
+<html lang="fr"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Ely WebApp</title><style>
+:root{--bg:#0d1117;--fg:#c9d1d9;--dim:#6e7681;--cyan:#58a6ff;--green:#3fb950;--red:#f85149;--panel:#161b22;--border:#30363d}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;height:100vh;display:flex;flex-direction:column}
+header{padding:8px 16px;border-bottom:1px solid var(--border);font-size:13px;display:flex;gap:16px}
+header .dot{color:var(--green)}
+#conv{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:8px}
+.msg{max-width:85%;padding:10px 14px;border-radius:8px;line-height:1.6}
+.user{align-self:flex-end;background:var(--cyan);color:#fff}
+.agent{align-self:flex-start;background:var(--panel);border:1px solid var(--border)}
+.tool{align-self:flex-start;background:var(--panel);border-left:3px solid var(--cyan);font-size:12px;color:var(--dim)}
+.reasoning{align-self:flex-start;background:var(--panel);border-left:3px solid var(--dim);font-size:12px;color:var(--dim);font-style:italic}
+.error{align-self:center;color:var(--red);font-size:12px}
+.status{align-self:center;color:var(--dim);font-size:12px}
+#input-area{padding:12px 16px;border-top:1px solid var(--border);display:flex;gap:8px}
+#input-area input{flex:1;background:var(--panel);border:1px solid var(--border);color:var(--fg);padding:10px 14px;border-radius:6px;font-size:14px;outline:none}
+#input-area input:focus{border-color:var(--cyan)}
+#input-area button{background:var(--cyan);color:#fff;border:none;padding:10px 18px;border-radius:6px;cursor:pointer;font-weight:600}
+footer{padding:6px 16px;border-top:1px solid var(--border);font-size:11px;color:var(--dim);display:flex;gap:16px}
+pre{background:#0d1117;padding:8px;border-radius:4px;overflow-x:auto;margin:4px 0}
+</style></head><body>
+<header><span><span class="dot">●</span> <b>Ely</b></span><span id="model">...</span><span id="ctx">ctx: default</span><span id="tokens">🪙 0</span></header>
+<div id="conv"></div>
+<div id="input-area"><input id="input" placeholder="Message, ?question, #cmd, ou /help..." autofocus onkeydown="if(event.key==='Enter')send()"><button onclick="send()">Send</button></div>
+<footer><span>? = quick LLM</span> <span># = bash</span> <span>/ = commands</span></footer>
+<script>
+const conv=document.getElementById('conv'),input=document.getElementById('input');
+let currentMsg=null,streamBuffer='';
+function addMsg(role,content){const d=document.createElement('div');d.className='msg '+role;d.innerHTML=content;conv.appendChild(d);conv.scrollTop=conv.scrollHeight;return d}
+function addStatus(text){const d=document.createElement('div');d.className='status';d.textContent=text;conv.appendChild(d);conv.scrollTop=conv.scrollHeight;return d}
+async function send(){const msg=input.value.trim();if(!msg)return;input.value='';addMsg('user',msg);
+const statusEl=addStatus('⏳ ...');const resp=await fetch('/chat',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({message:msg})});
+const reader=resp.body.getReader();const decoder=new TextDecoder();let buf='',agentEl=null,reasoningEl=null;
+while(true){const{ done, value}=await reader.read();if(done)break;buf+=decoder.decode(value,{stream:true});
+const parts=buf.split('\\n\\n');buf=parts.pop();
+for(const part of parts){const lines=part.split('\\n');let event='',data='';
+for(const line of lines){if(line.startsWith('event: '))event=line.slice(7);else if(line.startsWith('data: '))data=line.slice(6)}
+if(!event)continue;statusEl?.remove();
+if(event==='stream'){if(!agentEl)agentEl=addMsg('agent','');streamBuffer+=data;agentEl.textContent=streamBuffer}
+else if(event==='reasoning'){if(!reasoningEl)reasoningEl=addMsg('reasoning','');if(reasoningEl.textContent.length<400)reasoningEl.textContent+=data}
+else if(event==='tool_calls'){const tcs=JSON.parse(data);for(const tc of tcs)addMsg('tool','🔧 <b>'+tc.name+'</b> '+tc.args.slice(0,100))}
+else if(event==='tool_result'){addMsg('tool','⮡ '+data.slice(0,200))}
+else if(event==='done'){const d=JSON.parse(data);if(agentEl)agentEl.textContent=d.reply||'';streamBuffer='';agentEl=null;reasoningEl=null;document.getElementById('tokens').textContent='🪙 '+(d.total_tokens||0).toLocaleString()}
+else if(event==='error'){addMsg('error',data)}
+else if(event==='bash'){addMsg('agent','<pre>'+data+'</pre>')}
+else if(event==='cleared'){conv.innerHTML='';addStatus('✨ Cleared')}
+else if(event==='help'){addMsg('agent',data)}
+}}}
+</script></body></html>"""
 
 
 if __name__ == "__main__":
